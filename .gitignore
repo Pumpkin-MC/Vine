@@ -1,0 +1,55 @@
+# === RUST BUILDS AND ARTIFACTS ===
+/target
+**/*.rs.bk
+*.pdb
+*.profraw
+*.profdata
+perf.data
+perf.data.old
+
+# === RUNTIME GENERATED & STATE FILES ===
+.vine-server-id
+.pumpkin/
+.vine/
+logs/
+*.log
+crash-reports/
+*.pid
+
+# === CRYPTOGRAPHIC KEYS & SECRETS ===
+identity.key
+telemetry_key.bin
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx
+# === CONFIGURATION & SECRETS ===
+vine.toml
+*.local.toml
+.env
+.env.*
+
+# === OS GENERATED FILES ===
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.directory
+
+# === EDITORS AND IDES ===
+.idea/
+.vscode/
+.zed/
+.fleet/
+*.swp
+*.swo
+*~
+*.bak
+*.tmp
+*.temp
+*.sublime-project
+*.sublime-workspace
