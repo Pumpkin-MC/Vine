@@ -1,0 +1,431 @@
+pub mod glist;
+pub mod send;
+pub mod server;
+
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use tracing::info;
+
+use pumpkin_command::argument_builder::{ArgumentBuilder, argument, command};
+use pumpkin_command::argument_types::core::string::StringArgumentType;
+use pumpkin_command::context::command_context::CommandContext;
+use pumpkin_command::context::string_range::StringRange;
+pub use pumpkin_command::dispatcher::CommandDispatcher as RawCommandDispatcher;
+pub use pumpkin_command::errors::command_syntax_error::CommandSyntaxError;
+pub use pumpkin_command::errors::error_types::LiteralCommandErrorType;
+pub use pumpkin_command::node::{CommandExecutor, CommandExecutorResult};
+pub use pumpkin_command::source::CommandSource;
+use pumpkin_command::suggestion::Suggestion;
+use pumpkin_command::suggestion::provider::{SuggestionProvider, SuggestionProviderResult};
+pub use pumpkin_command::suggestion::suggestions::Suggestions;
+use pumpkin_command::suggestion::suggestions::SuggestionsBuilder;
+use pumpkin_protocol::java::client::play::CommandSuggestion;
+use pumpkin_util::text::TextComponent;
+
+use crate::config::Config;
+use crate::session::{PlayerAction, SessionManager};
+
+pub static PROXY_COMMAND_ERROR: LiteralCommandErrorType =
+    LiteralCommandErrorType::new("Proxy command execution failed");
+
+pub fn command_error(msg: impl Into<String>) -> CommandSyntaxError {
+    CommandSyntaxError::create_without_context(
+        &PROXY_COMMAND_ERROR,
+        TextComponent::text(msg.into()),
+    )
+}
+
+/// Represents the origin that invoked a command
+#[derive(Clone)]
+pub enum CommandSender {
+    /// Command invoked via proxy console (stdin)
+    Console,
+    /// Command invoked by an in-game player
+    Player {
+        username: String,
+        action_tx: mpsc::UnboundedSender<PlayerAction>,
+    },
+}
+
+impl CommandSender {
+    /// Sends response feedback to the command sender
+    pub fn send_message(&self, message: TextComponent) {
+        match self {
+            Self::Console => {
+                info!("{}", message.to_pretty_console());
+            }
+            Self::Player { action_tx, .. } => {
+                let _ = action_tx.send(PlayerAction::Message(message));
+            }
+        }
+    }
+
+    /// Sends a plain text message to the command sender
+    pub fn send_text(&self, text: impl Into<String>) {
+        self.send_message(TextComponent::text(text.into()));
+    }
+
+    /// Returns the name of the sender
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Console => "CONSOLE",
+            Self::Player { username, .. } => username,
+        }
+    }
+}
+
+/// Execution context passed to commands
+#[derive(Clone)]
+pub struct ProxyCommandSource {
+    pub sender: CommandSender,
+    pub config: Arc<Config>,
+    pub session_manager: Arc<SessionManager>,
+}
+
+impl ProxyCommandSource {
+    /// Evaluates if the command source has the specified permission node.
+    /// Console always returns `true`.
+    pub fn has_permission(&self, node: &str) -> bool {
+        match &self.sender {
+            CommandSender::Console => true,
+            CommandSender::Player { username, .. } => {
+                self.config.permissions.has_permission(username, node)
+            }
+        }
+    }
+
+    /// Returns true if the command sender has administrative privileges (node `vine.admin` or `*`)
+    pub fn is_admin(&self) -> bool {
+        self.has_permission("vine.admin")
+    }
+}
+
+impl CommandSource for ProxyCommandSource {
+    fn send_message(&self, message: TextComponent) {
+        self.sender.send_message(message);
+    }
+
+    fn send_error(&self, error: TextComponent) {
+        self.send_message(error);
+    }
+
+    fn has_permission(&self, permission: &str) -> bool {
+        self.has_permission(permission)
+    }
+}
+
+/// Help command listing registered commands
+pub struct HelpCommandExecutor;
+
+impl CommandExecutor<ProxyCommandSource> for HelpCommandExecutor {
+    fn execute(&self, context: &CommandContext<ProxyCommandSource>) -> CommandExecutorResult {
+        let text = "Available commands:\n  - /server [server]            : View current server or switch to another backend\n  - /send <player|all> <server> : Send players to another backend (Admin)\n  - /list                       : List connected players\n  - /glist                      : List players grouped by server\n  - /help [command]             : Show this help or info about a command";
+        context.source.send_message(TextComponent::text(text));
+        Ok(1)
+    }
+}
+
+/// Suggestion provider for `/help [command]`
+struct HelpSuggestionProvider;
+
+impl SuggestionProvider<ProxyCommandSource> for HelpSuggestionProvider {
+    fn suggest(
+        &self,
+        context: &CommandContext<ProxyCommandSource>,
+        builder: SuggestionsBuilder,
+    ) -> SuggestionProviderResult {
+        let mut builder = builder;
+        let remaining = builder.remaining_lowercase().to_string();
+        let is_admin = context.source.is_admin();
+
+        for (cmd_name, required_perm) in [
+            ("server", Some("vine.command.server")),
+            ("send", Some("vine.command.send")),
+            ("list", Some("vine.command.list")),
+            ("glist", Some("vine.command.glist")),
+            ("help", Some("vine.command.help")),
+        ] {
+            if cmd_name.starts_with(&remaining) {
+                let allowed = is_admin
+                    || required_perm
+                        .map(|p| context.source.has_permission(p))
+                        .unwrap_or(true);
+                if allowed {
+                    builder = builder.suggest(cmd_name);
+                }
+            }
+        }
+        builder.build()
+    }
+}
+
+/// Detailed help executor for `/help <command>`
+struct CommandSpecificHelpExecutor;
+
+impl CommandExecutor<ProxyCommandSource> for CommandSpecificHelpExecutor {
+    fn execute(&self, context: &CommandContext<ProxyCommandSource>) -> CommandExecutorResult {
+        let cmd = StringArgumentType::get(context, "command")?;
+        let msg = match cmd.to_ascii_lowercase().as_str() {
+            "server" => {
+                "Command /server:\n  Usage: /server [server]\n  Description: View your current server or switch to another backend server."
+            }
+            "send" => {
+                "Command /send:\n  Usage: /send <player|all> <server>\n  Description: Send players to another backend server (Requires vine.command.send / admin)."
+            }
+            "list" => {
+                "Command /list:\n  Usage: /list\n  Description: List all online players connected to the proxy."
+            }
+            "glist" => {
+                "Command /glist:\n  Usage: /glist\n  Description: List online players grouped by backend server."
+            }
+            "help" => {
+                "Command /help:\n  Usage: /help [command]\n  Description: Show help information for available proxy commands."
+            }
+            _ => "Unknown command. Use /help to see all available proxy commands.",
+        };
+        context.source.send_message(TextComponent::text(msg));
+        Ok(1)
+    }
+}
+
+/// List command displaying online players
+pub struct ListCommandExecutor;
+
+impl CommandExecutor<ProxyCommandSource> for ListCommandExecutor {
+    fn execute(&self, context: &CommandContext<ProxyCommandSource>) -> CommandExecutorResult {
+        let sessions = context.source.session_manager.list_sessions();
+        if sessions.is_empty() {
+            context
+                .source
+                .send_message(TextComponent::text("There are 0 players online."));
+            return Ok(0);
+        }
+
+        let players_info: Vec<String> = sessions
+            .into_iter()
+            .map(|s| format!("{} ({})", s.username, s.current_server))
+            .collect();
+
+        context.source.send_message(TextComponent::text(format!(
+            "Online players ({}): {}",
+            players_info.len(),
+            players_info.join(", ")
+        )));
+        Ok(players_info.len() as i32)
+    }
+}
+
+/// Central registry and dispatcher for commands using `pumpkin-command`
+pub struct CommandDispatcher {
+    inner: RawCommandDispatcher<ProxyCommandSource>,
+}
+
+impl Default for CommandDispatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CommandDispatcher {
+    /// Creates a new CommandDispatcher with default built-in commands
+    pub fn new() -> Self {
+        let mut dispatcher = RawCommandDispatcher::new();
+        server::register(&mut dispatcher);
+        send::register(&mut dispatcher);
+        glist::register(&mut dispatcher);
+        dispatcher.register(
+            command("list", "Lists online players connected to the proxy")
+                .executes(ListCommandExecutor),
+        );
+        dispatcher.register(
+            command("help", "Displays list of available proxy commands")
+                .executes(HelpCommandExecutor)
+                .then(
+                    argument("command", StringArgumentType::SingleWord)
+                        .suggests(HelpSuggestionProvider)
+                        .executes(CommandSpecificHelpExecutor),
+                ),
+        );
+        Self { inner: dispatcher }
+    }
+
+    /// Returns true if a command with the given name is registered
+    pub fn has_command(&self, name: &str) -> bool {
+        let clean = name.trim_start_matches('/').to_ascii_lowercase();
+        self.inner.has_command(&clean)
+    }
+
+    /// Dispatches a command for execution, reporting any error messages back to the source
+    pub fn handle_command(&self, source: &ProxyCommandSource, input: &str) {
+        self.inner.handle_command(source, input);
+    }
+
+    /// Executes raw input directly, returning the execution result
+    pub fn execute_input(
+        &self,
+        input: &str,
+        source: &ProxyCommandSource,
+    ) -> Result<i32, CommandSyntaxError> {
+        let trimmed = input.trim();
+        let clean = trimmed.strip_prefix('/').unwrap_or(trimmed);
+        self.inner.execute_input(clean, source)
+    }
+
+    /// Returns suggestions with range information for any command input.
+    /// If input contains arguments (i.e. has a space), it evaluates argument suggestions.
+    /// If input is typing the root command name, it suggests permitted root commands starting with the prefix.
+    pub fn suggest_command(&self, input: &str, source: &ProxyCommandSource) -> Suggestions {
+        let clean = input.strip_prefix('/').unwrap_or(input);
+        if clean.contains(' ') {
+            let first_word = clean.split_whitespace().next().unwrap_or(clean);
+            if self.has_command(first_word) {
+                return self.inner.suggest_with_range(clean, source);
+            }
+            return Suggestions::empty();
+        }
+
+        let clean_lower = clean.to_ascii_lowercase();
+        let permitted = self.inner.get_all_permitted_commands(source);
+        let mut suggestions = Vec::new();
+        for (cmd_name, description) in permitted {
+            if cmd_name.starts_with(&clean_lower) {
+                suggestions.push(Suggestion::with_tooltip(
+                    StringRange::between(0, clean.len()),
+                    cmd_name.to_string(),
+                    TextComponent::text(description.to_string()),
+                ));
+            }
+        }
+        Suggestions::new(StringRange::between(0, clean.len()), suggestions)
+    }
+
+    /// Returns suggestions for the command string
+    pub fn suggest(&self, input: &str, source: &ProxyCommandSource) -> Vec<CommandSuggestion> {
+        let suggestions = self.suggest_command(input, source);
+        suggestions
+            .suggestions
+            .into_iter()
+            .map(|s| CommandSuggestion {
+                suggestion: s.text.cached_text().clone(),
+                tooltip: s.tooltip,
+            })
+            .collect()
+    }
+
+    /// Returns suggestions with range information
+    pub fn suggest_with_range(&self, input: &str, source: &ProxyCommandSource) -> Suggestions {
+        self.suggest_command(input, source)
+    }
+
+    /// Exposes the inner pumpkin command dispatcher
+    pub fn raw(&self) -> &RawCommandDispatcher<ProxyCommandSource> {
+        &self.inner
+    }
+
+    /// Exposes a mutable reference to the inner pumpkin command dispatcher
+    pub fn raw_mut(&mut self) -> &mut RawCommandDispatcher<ProxyCommandSource> {
+        &mut self.inner
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dispatcher_registration_and_dispatch() {
+        let dispatcher = CommandDispatcher::new();
+        assert!(dispatcher.has_command("send"));
+        assert!(dispatcher.has_command("/send"));
+        assert!(dispatcher.has_command("help"));
+        assert!(dispatcher.has_command("list"));
+        assert!(dispatcher.has_command("glist"));
+        assert!(dispatcher.has_command("/glist"));
+        assert!(!dispatcher.has_command("unknown"));
+
+        let config = Arc::new(Config::default());
+        let session_manager = Arc::new(SessionManager::new());
+        let source = ProxyCommandSource {
+            sender: CommandSender::Console,
+            config,
+            session_manager,
+        };
+
+        let res = dispatcher.execute_input("help", &source);
+        assert!(res.is_ok());
+
+        let res_slash = dispatcher.execute_input("/help", &source);
+        assert!(res_slash.is_ok());
+
+        let res_unknown = dispatcher.execute_input("unknown_cmd", &source);
+        assert!(res_unknown.is_err());
+    }
+
+    #[test]
+    fn test_suggest_various_inputs() {
+        let dispatcher = CommandDispatcher::new();
+        let config = Arc::new(Config::default());
+        let session_manager = Arc::new(SessionManager::new());
+        let source = ProxyCommandSource {
+            sender: CommandSender::Console,
+            config,
+            session_manager,
+        };
+
+        let s_empty = dispatcher.suggest_with_range("", &source);
+        let names_empty: Vec<&str> = s_empty
+            .suggestions
+            .iter()
+            .map(|s| s.text.cached_text().as_str())
+            .collect();
+        assert!(names_empty.contains(&"server"));
+        assert!(names_empty.contains(&"send"));
+        assert!(names_empty.contains(&"glist"));
+        assert!(names_empty.contains(&"list"));
+        assert!(names_empty.contains(&"help"));
+
+        let s_s = dispatcher.suggest_with_range("s", &source);
+        let names_s: Vec<&str> = s_s
+            .suggestions
+            .iter()
+            .map(|s| s.text.cached_text().as_str())
+            .collect();
+        assert_eq!(names_s, vec!["send", "server"]);
+
+        let s_ser = dispatcher.suggest_with_range("ser", &source);
+        let names_ser: Vec<&str> = s_ser
+            .suggestions
+            .iter()
+            .map(|s| s.text.cached_text().as_str())
+            .collect();
+        assert_eq!(names_ser, vec!["server"]);
+
+        let s_server = dispatcher.suggest_with_range("server", &source);
+        let names_server: Vec<&str> = s_server
+            .suggestions
+            .iter()
+            .map(|s| s.text.cached_text().as_str())
+            .collect();
+        assert_eq!(names_server, vec!["server"]);
+
+        let s_server_space = dispatcher.suggest_with_range("server ", &source);
+        let names_server_space: Vec<&str> = s_server_space
+            .suggestions
+            .iter()
+            .map(|s| s.text.cached_text().as_str())
+            .collect();
+        assert!(names_server_space.contains(&"lobby"));
+
+        let s_help_space = dispatcher.suggest_with_range("help ", &source);
+        let names_help_space: Vec<&str> = s_help_space
+            .suggestions
+            .iter()
+            .map(|s| s.text.cached_text().as_str())
+            .collect();
+        assert!(names_help_space.contains(&"server"));
+        assert!(names_help_space.contains(&"send"));
+        assert!(names_help_space.contains(&"glist"));
+        assert!(names_help_space.contains(&"list"));
+        assert!(names_help_space.contains(&"help"));
+    }
+}
