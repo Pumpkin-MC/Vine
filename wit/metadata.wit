@@ -1,0 +1,9 @@
+interface metadata {
+    record plugin-metadata {
+        name: string,
+        version: string,
+        authors: list<string>,
+        description: option<string>,
+        dependencies: list<string>,
+    }
+}

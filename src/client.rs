@@ -25,6 +25,8 @@ use crate::backend::{BackendBridge, Router};
 use crate::command::CommandDispatcher;
 use crate::config::Config;
 use crate::network::PrefixedRead;
+use crate::plugin::PluginManager;
+use crate::plugin::api::{PlayerLoginEvent, PlayerPreLoginEvent, ProxyPingEvent};
 use crate::security::Sanitizer;
 use crate::session::SessionManager;
 use crate::status::StatusHandler;
@@ -55,6 +57,7 @@ pub struct ClientHandler {
     online_players: Arc<AtomicUsize>,
     session_manager: Arc<SessionManager>,
     command_dispatcher: Arc<CommandDispatcher>,
+    plugin_manager: Arc<PluginManager>,
 }
 
 impl ClientHandler {
@@ -69,6 +72,7 @@ impl ClientHandler {
         online_players: Arc<AtomicUsize>,
         session_manager: Arc<SessionManager>,
         command_dispatcher: Arc<CommandDispatcher>,
+        plugin_manager: Arc<PluginManager>,
     ) -> Self {
         Self {
             peer_addr,
@@ -80,6 +84,7 @@ impl ClientHandler {
             online_players,
             session_manager,
             command_dispatcher,
+            plugin_manager,
         }
     }
 
@@ -161,9 +166,29 @@ impl ClientHandler {
             .map_err(|e| ClientError::DecodeError(e.to_string()))?;
 
         if raw_status.id == 0x00 {
-            let status_pkt = self
-                .status_handler
-                .create_status_packet(client_version, Some(virtual_host));
+            let initial_motd = self.status_handler.resolve_motd_text(Some(virtual_host));
+            let initial_online = self
+                .online_players
+                .load(std::sync::atomic::Ordering::Relaxed) as u32;
+            let mut ping_event = ProxyPingEvent {
+                client_ip: self.peer_addr.ip().to_string(),
+                protocol_version: client_version.protocol_version() as u32,
+                virtual_host: virtual_host.to_string(),
+                motd: initial_motd,
+                max_players: self.config.motd.max_players,
+                online_players: initial_online,
+                version_name: self.config.motd.version_name.clone(),
+            };
+            self.plugin_manager.fire_proxy_ping(&mut ping_event).await;
+
+            let status_pkt = self.status_handler.create_custom_status_packet(
+                client_version,
+                &ping_event.motd,
+                ping_event.max_players,
+                ping_event.online_players,
+                &ping_event.version_name,
+                Some(virtual_host),
+            );
             let status_bytes = status_pkt
                 .serialize_packet(&client_version)
                 .map_err(|e| ClientError::EncodeError(e.to_string()))?;
@@ -214,6 +239,30 @@ impl ClientHandler {
             .map_err(|e| ClientError::DecodeError(e.to_string()))?;
 
         let username = login_start.name.to_string();
+
+        let mut pre_login_event = PlayerPreLoginEvent {
+            client_ip: client_ip.to_string(),
+            username: username.clone(),
+            protocol_version: client_version.protocol_version() as u32,
+            virtual_host: virtual_host.clone(),
+            cancelled: false,
+            cancel_reason: None,
+        };
+        self.plugin_manager
+            .fire_player_pre_login(&mut pre_login_event)
+            .await;
+        if pre_login_event.cancelled {
+            let reason = pre_login_event
+                .cancel_reason
+                .as_deref()
+                .unwrap_or("Connection cancelled by plugin");
+            warn!(
+                "[{}] Player '{}' pre-login cancelled by plugin: {}",
+                self.peer_addr, username, reason
+            );
+            Self::kick(&mut encoder, client_version, reason).await?;
+            return Ok(());
+        }
 
         if self.config.security.validate_usernames && !Sanitizer::is_valid_username(&username) {
             warn!(
@@ -347,6 +396,29 @@ impl ClientHandler {
             AuthenticatedPlayer::offline(&username)
         };
 
+        let mut login_event = PlayerLoginEvent {
+            uuid: authenticated_player.id.to_string(),
+            username: authenticated_player.username.clone(),
+            client_ip: client_ip.to_string(),
+            cancelled: false,
+            cancel_reason: None,
+        };
+        self.plugin_manager
+            .fire_player_login(&mut login_event)
+            .await;
+        if login_event.cancelled {
+            let reason = login_event
+                .cancel_reason
+                .as_deref()
+                .unwrap_or("Login cancelled by plugin");
+            warn!(
+                "[{}] Player '{}' login cancelled by plugin: {}",
+                self.peer_addr, authenticated_player.username, reason
+            );
+            Self::kick(&mut encoder, client_version, reason).await?;
+            return Ok(());
+        }
+
         let comp_threshold = self.config.server.compression_threshold;
         if comp_threshold > 0 {
             let set_comp = CSetCompression::new(VarInt(comp_threshold));
@@ -416,6 +488,7 @@ impl ClientHandler {
             self.session_manager.clone(),
             self.command_dispatcher.clone(),
             self.config.clone(),
+            self.plugin_manager.clone(),
         );
 
         bridge.run(decoder, encoder).await?;

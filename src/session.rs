@@ -14,6 +14,10 @@ pub enum PlayerAction {
     Transfer { host: String, port: u16 },
     /// Send a system chat message to the player
     Message(TextComponent),
+    /// Disconnect/kick the player with a reason
+    Disconnect(String),
+    /// Send a custom plugin message / payload to the player
+    PluginMessage { channel: String, data: Vec<u8> },
 }
 
 /// Represents an active connected player session on the proxy
@@ -23,6 +27,8 @@ pub struct PlayerSession {
     pub uuid: Uuid,
     pub current_server: String,
     pub action_tx: mpsc::UnboundedSender<PlayerAction>,
+    pub client_ip: String,
+    pub protocol_version: u32,
 }
 
 /// Thread-safe registry of connected player sessions
@@ -111,6 +117,8 @@ mod tests {
             uuid: Uuid::new_v4(),
             current_server: "lobby".to_string(),
             action_tx: tx,
+            client_ip: "127.0.0.1:12345".to_string(),
+            protocol_version: 765,
         };
 
         manager.register(session);
@@ -135,6 +143,8 @@ mod tests {
             uuid: Uuid::new_v4(),
             current_server: "lobby".to_string(),
             action_tx: tx,
+            client_ip: "127.0.0.1:12346".to_string(),
+            protocol_version: 765,
         };
         manager.register(session);
         assert_eq!(manager.get_session("Alex").unwrap().current_server, "lobby");

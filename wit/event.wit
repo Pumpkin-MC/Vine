@@ -1,0 +1,106 @@
+interface event {
+    use types.{event-priority};
+
+    enum event-type {
+        proxy-ping,
+        player-pre-login,
+        player-login,
+        player-join,
+        server-connect,
+        server-connected,
+        player-disconnect,
+        player-chat,
+        player-command,
+        plugin-message,
+    }
+
+    record proxy-ping-event {
+        client-ip: string,
+        protocol-version: u32,
+        virtual-host: string,
+        motd: string,
+        max-players: u32,
+        online-players: u32,
+        version-name: string,
+    }
+
+    record player-pre-login-event {
+        client-ip: string,
+        username: string,
+        protocol-version: u32,
+        virtual-host: string,
+        cancelled: bool,
+        cancel-reason: option<string>,
+    }
+
+    record player-login-event {
+        uuid: string,
+        username: string,
+        client-ip: string,
+        cancelled: bool,
+        cancel-reason: option<string>,
+    }
+
+    record player-join-event {
+        uuid: string,
+        username: string,
+        client-ip: string,
+        initial-server: string,
+    }
+
+    record server-connect-event {
+        uuid: string,
+        username: string,
+        current-server: option<string>,
+        target-server: string,
+        cancelled: bool,
+        cancel-reason: option<string>,
+    }
+
+    record server-connected-event {
+        uuid: string,
+        username: string,
+        server-name: string,
+    }
+
+    record player-disconnect-event {
+        uuid: string,
+        username: string,
+        last-server: option<string>,
+    }
+
+    record player-chat-event {
+        uuid: string,
+        username: string,
+        message: string,
+        cancelled: bool,
+    }
+
+    record player-command-event {
+        uuid: string,
+        username: string,
+        command: string,
+        cancelled: bool,
+    }
+
+    record plugin-message-event {
+        channel: string,
+        data: list<u8>,
+        player-uuid: option<string>,
+        server-name: option<string>,
+        cancelled: bool,
+    }
+
+    variant event {
+        proxy-ping(proxy-ping-event),
+        player-pre-login(player-pre-login-event),
+        player-login(player-login-event),
+        player-join(player-join-event),
+        server-connect(server-connect-event),
+        server-connected(server-connected-event),
+        player-disconnect(player-disconnect-event),
+        player-chat(player-chat-event),
+        player-command(player-command-event),
+        plugin-message(plugin-message-event),
+    }
+}

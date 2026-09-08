@@ -1,0 +1,34 @@
+package vine:plugin@0.1.0;
+
+world plugin {
+    use context.{context};
+    use event.{event};
+    use types.{command-sender};
+    use metadata.{plugin-metadata};
+
+    import logging;
+    import proxy;
+    import context;
+    import command;
+
+    /// Called once by the host to initialize the plugin instance.
+    export init-plugin: func();
+
+    /// Called when the plugin is loaded into the proxy.
+    export on-load: func(ctx: context) -> result<_, string>;
+
+    /// Called when the plugin is being unloaded.
+    export on-unload: func(ctx: context) -> result<_, string>;
+
+    /// Provides plugin metadata to the proxy host.
+    export get-metadata: func() -> plugin-metadata;
+
+    /// Dispatches an event to the plugin handler.
+    export handle-event: func(handler-id: u32, evt: event) -> event;
+
+    /// Dispatches a command execution to the plugin.
+    export handle-command: func(command-id: u32, sender: command-sender, args: list<string>) -> result<s32, string>;
+
+    /// Dispatches command suggestion / tab completion to the plugin.
+    export handle-command-suggestion: func(command-id: u32, sender: command-sender, args: list<string>) -> list<string>;
+}

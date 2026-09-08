@@ -6,6 +6,7 @@ pub mod command;
 pub mod config;
 pub mod network;
 pub mod permissions;
+pub mod plugin;
 pub mod proxy;
 pub mod security;
 pub mod session;

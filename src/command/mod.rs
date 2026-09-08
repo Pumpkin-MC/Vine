@@ -215,9 +215,11 @@ impl CommandExecutor<ProxyCommandSource> for ListCommandExecutor {
     }
 }
 
+use std::sync::RwLock;
+
 /// Central registry and dispatcher for commands using `pumpkin-command`
 pub struct CommandDispatcher {
-    inner: RawCommandDispatcher<ProxyCommandSource>,
+    inner: RwLock<RawCommandDispatcher<ProxyCommandSource>>,
 }
 
 impl Default for CommandDispatcher {
@@ -246,18 +248,36 @@ impl CommandDispatcher {
                         .executes(CommandSpecificHelpExecutor),
                 ),
         );
-        Self { inner: dispatcher }
+        Self {
+            inner: RwLock::new(dispatcher),
+        }
+    }
+
+    /// Registers a new command builder into the dispatcher
+    pub fn register(
+        &self,
+        builder: pumpkin_command::argument_builder::CommandArgumentBuilder<ProxyCommandSource>,
+    ) {
+        if let Ok(mut lock) = self.inner.write() {
+            lock.register(builder);
+        }
     }
 
     /// Returns true if a command with the given name is registered
     pub fn has_command(&self, name: &str) -> bool {
         let clean = name.trim_start_matches('/').to_ascii_lowercase();
-        self.inner.has_command(&clean)
+        if let Ok(lock) = self.inner.read() {
+            lock.has_command(&clean)
+        } else {
+            false
+        }
     }
 
     /// Dispatches a command for execution, reporting any error messages back to the source
     pub fn handle_command(&self, source: &ProxyCommandSource, input: &str) {
-        self.inner.handle_command(source, input);
+        if let Ok(lock) = self.inner.read() {
+            lock.handle_command(source, input);
+        }
     }
 
     /// Executes raw input directly, returning the execution result
@@ -268,7 +288,23 @@ impl CommandDispatcher {
     ) -> Result<i32, CommandSyntaxError> {
         let trimmed = input.trim();
         let clean = trimmed.strip_prefix('/').unwrap_or(trimmed);
-        self.inner.execute_input(clean, source)
+        if let Ok(lock) = self.inner.read() {
+            lock.execute_input(clean, source)
+        } else {
+            Err(command_error("Command dispatcher lock poisoned"))
+        }
+    }
+
+    /// Returns all permitted commands for the given source
+    pub fn get_all_permitted_commands(&self, source: &ProxyCommandSource) -> Vec<(String, String)> {
+        if let Ok(lock) = self.inner.read() {
+            lock.get_all_permitted_commands(source)
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        } else {
+            Vec::new()
+        }
     }
 
     /// Returns suggestions with range information for any command input.
@@ -278,14 +314,16 @@ impl CommandDispatcher {
         let clean = input.strip_prefix('/').unwrap_or(input);
         if clean.contains(' ') {
             let first_word = clean.split_whitespace().next().unwrap_or(clean);
-            if self.has_command(first_word) {
-                return self.inner.suggest_with_range(clean, source);
+            if self.has_command(first_word)
+                && let Ok(lock) = self.inner.read()
+            {
+                return lock.suggest_with_range(clean, source);
             }
             return Suggestions::empty();
         }
 
         let clean_lower = clean.to_ascii_lowercase();
-        let permitted = self.inner.get_all_permitted_commands(source);
+        let permitted = self.get_all_permitted_commands(source);
         let mut suggestions = Vec::new();
         for (cmd_name, description) in permitted {
             if cmd_name.starts_with(&clean_lower) {
@@ -315,16 +353,6 @@ impl CommandDispatcher {
     /// Returns suggestions with range information
     pub fn suggest_with_range(&self, input: &str, source: &ProxyCommandSource) -> Suggestions {
         self.suggest_command(input, source)
-    }
-
-    /// Exposes the inner pumpkin command dispatcher
-    pub fn raw(&self) -> &RawCommandDispatcher<ProxyCommandSource> {
-        &self.inner
-    }
-
-    /// Exposes a mutable reference to the inner pumpkin command dispatcher
-    pub fn raw_mut(&mut self) -> &mut RawCommandDispatcher<ProxyCommandSource> {
-        &mut self.inner
     }
 }
 

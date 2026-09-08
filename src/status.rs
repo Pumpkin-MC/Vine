@@ -122,7 +122,7 @@ impl StatusHandler {
     }
 
     /// Resolves MOTD description for the virtual host or falls back to global default
-    fn resolve_motd_text(&self, host: Option<&str>) -> String {
+    pub fn resolve_motd_text(&self, host: Option<&str>) -> String {
         if let Some(h) = host {
             let clean_host = h.split(':').next().unwrap_or(h).trim();
 
@@ -158,6 +158,58 @@ impl StatusHandler {
         virtual_host: Option<&str>,
     ) -> CStatusResponse {
         let json = self.build_status_response(client_version, virtual_host);
+        CStatusResponse::new(json)
+    }
+
+    /// Create custom CStatusResponse packet with overridden fields from plugins
+    pub fn create_custom_status_packet(
+        &self,
+        client_version: JavaMinecraftVersion,
+        motd: &str,
+        max_players: u32,
+        online_players: u32,
+        version_name: &str,
+        virtual_host: Option<&str>,
+    ) -> CStatusResponse {
+        let protocol = if client_version == JavaMinecraftVersion::Unknown {
+            self.motd.protocol_version
+        } else {
+            client_version.protocol_version()
+        };
+
+        let icon_uri = self.icon_manager.get_icon_for_host(virtual_host);
+
+        let sample: Vec<PlayerSample> = if self.motd.show_sample_players {
+            self.motd
+                .sample_players
+                .iter()
+                .map(|name| PlayerSample {
+                    name,
+                    id: Uuid::nil().to_string(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let status = StatusJson {
+            version: StatusVersion {
+                name: version_name,
+                protocol,
+            },
+            players: StatusPlayers {
+                max: max_players,
+                online: online_players as usize,
+                sample,
+            },
+            description: StatusDescription {
+                text: motd.to_string(),
+            },
+            enforce_secure_chat: false,
+            favicon: icon_uri.as_deref(),
+        };
+
+        let json = serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string());
         CStatusResponse::new(json)
     }
 

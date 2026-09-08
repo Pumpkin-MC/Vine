@@ -1,0 +1,35 @@
+interface types {
+    record player-info {
+        uuid: string,
+        username: string,
+        current-server: string,
+        client-ip: string,
+        protocol-version: u32,
+    }
+
+    record server-info {
+        name: string,
+        address: string,
+        player-count: u32,
+    }
+
+    enum event-priority {
+        lowest,
+        low,
+        normal,
+        high,
+        highest,
+        monitor,
+    }
+
+    enum command-sender-type {
+        console,
+        player,
+    }
+
+    record command-sender {
+        sender-type: command-sender-type,
+        name: string,
+        player-uuid: option<string>,
+    }
+}

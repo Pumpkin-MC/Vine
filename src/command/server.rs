@@ -182,6 +182,8 @@ mod tests {
             uuid: Uuid::new_v4(),
             current_server: "lobby".to_string(),
             action_tx: action_tx.clone(),
+            client_ip: "127.0.0.1".to_string(),
+            protocol_version: 765,
         };
         session_manager.register(session);
 

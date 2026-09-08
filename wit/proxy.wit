@@ -1,0 +1,33 @@
+interface proxy {
+    use types.{player-info, server-info};
+
+    /// Returns the total number of connected players.
+    get-player-count: func() -> u32;
+
+    /// Returns a list of all connected players.
+    get-players: func() -> list<player-info>;
+
+    /// Returns information for a specific player by username.
+    get-player-by-name: func(username: string) -> option<player-info>;
+
+    /// Returns information for a specific player by UUID string.
+    get-player-by-uuid: func(uuid: string) -> option<player-info>;
+
+    /// Returns a list of configured backend servers.
+    get-servers: func() -> list<server-info>;
+
+    /// Broadcasts a system chat message to all connected players and console.
+    broadcast: func(message: string);
+
+    /// Sends a system chat message to a specific player by UUID.
+    send-message: func(player-uuid: string, message: string) -> bool;
+
+    /// Disconnects/kicks a player by UUID with the given reason.
+    disconnect-player: func(player-uuid: string, reason: string) -> bool;
+
+    /// Requests switching/connecting a player to a backend server.
+    connect-player: func(player-uuid: string, server-name: string) -> bool;
+
+    /// Sends a plugin message / custom payload to a player.
+    send-plugin-message: func(player-uuid: string, channel: string, data: list<u8>) -> bool;
+}

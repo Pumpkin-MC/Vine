@@ -60,6 +60,29 @@ pub struct Config {
     pub bedrock: crate::bedrock::BedrockConfig,
     #[serde(default)]
     pub permissions: PermissionsConfig,
+    #[serde(default)]
+    pub plugins: PluginConfig,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PluginConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_plugins_dir")]
+    pub plugin_dir: String,
+}
+
+fn default_plugins_dir() -> String {
+    "./plugins".to_string()
+}
+
+impl Default for PluginConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            plugin_dir: default_plugins_dir(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -361,6 +384,7 @@ impl Default for Config {
             telemetry: TelemetryConfig::default(),
             bedrock: crate::bedrock::BedrockConfig::default(),
             permissions: PermissionsConfig::default(),
+            plugins: PluginConfig::default(),
         }
     }
 }

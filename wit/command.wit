@@ -1,0 +1,6 @@
+interface command {
+    use types.{command-sender};
+
+    /// Reply to a command sender
+    reply: func(sender: command-sender, message: string);
+}

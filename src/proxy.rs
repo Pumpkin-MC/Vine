@@ -27,6 +27,7 @@ pub struct ProxyServer {
     online_players: Arc<AtomicUsize>,
     session_manager: Arc<SessionManager>,
     command_dispatcher: Arc<CommandDispatcher>,
+    plugin_manager: Arc<crate::plugin::PluginManager>,
 }
 
 impl ProxyServer {
@@ -68,6 +69,14 @@ impl ProxyServer {
 
         let router = Arc::new(Router::new(config.routing.clone(), config.servers.clone()));
 
+        let plugins_dir = std::path::PathBuf::from(&config.plugins.plugin_dir);
+        let plugin_manager = crate::plugin::PluginManager::new(plugins_dir)?;
+        plugin_manager.init_proxy_context(
+            config.clone(),
+            session_manager.clone(),
+            command_dispatcher.clone(),
+        );
+
         Ok(Self {
             config,
             keystore,
@@ -78,6 +87,7 @@ impl ProxyServer {
             online_players,
             session_manager,
             command_dispatcher,
+            plugin_manager,
         })
     }
 
@@ -221,6 +231,16 @@ impl ProxyServer {
             }
         });
 
+        if self.config.plugins.enabled {
+            info!(
+                "Loading plugins from '{}'...",
+                self.config.plugins.plugin_dir
+            );
+            if let Err(e) = self.plugin_manager.load_plugins().await {
+                error!("Failed to load plugins: {}", e);
+            }
+        }
+
         loop {
             tokio::select! {
                 accept_res = listener.accept() => {
@@ -235,6 +255,7 @@ impl ProxyServer {
                             let rate_limiter = self.rate_limiter.clone();
                             let session_manager = self.session_manager.clone();
                             let command_dispatcher = self.command_dispatcher.clone();
+                            let plugin_manager = self.plugin_manager.clone();
 
                             tokio::spawn(async move {
                                 if let Err(e) = network::configure_client_socket(&stream, &config.network) {
@@ -249,8 +270,8 @@ impl ProxyServer {
                                     match network::parse_proxy_protocol(&mut stream, peer_addr).await {
                                         Ok(res) => {
                                              effective_addr = res.client_addr;
-                                            leftover_bytes = res.leftover_bytes;
-                                            debug!("[{}] PROXY protocol resolved client IP: {}", peer_addr, effective_addr);
+                                             leftover_bytes = res.leftover_bytes;
+                                             debug!("[{}] PROXY protocol resolved client IP: {}", peer_addr, effective_addr);
                                         }
                                         Err(err) => {
                                             warn!("[{}] Dropped connection: PROXY protocol error: {}", peer_addr, err);
@@ -274,6 +295,7 @@ impl ProxyServer {
                                     online_players,
                                     session_manager,
                                     command_dispatcher,
+                                    plugin_manager,
                                 );
 
                                 if let Err(err) = handler.handle(stream, leftover_bytes).await {
@@ -295,6 +317,11 @@ impl ProxyServer {
         }
 
         info!("Vine proxy has stopped accepting connections.");
+
+        if self.config.plugins.enabled {
+            info!("Unloading plugins...");
+            self.plugin_manager.unload_plugins().await;
+        }
 
         if let Some(handle) = telemetry_handle {
             let timeout_secs = self.config.server.shutdown_timeout_secs.max(1);

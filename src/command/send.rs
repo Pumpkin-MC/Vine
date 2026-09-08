@@ -205,6 +205,8 @@ mod tests {
             uuid: Uuid::new_v4(),
             current_server: "lobby".to_string(),
             action_tx: tx,
+            client_ip: "127.0.0.1".to_string(),
+            protocol_version: 765,
         });
 
         let source = ProxyCommandSource {
@@ -333,6 +335,8 @@ mod tests {
             uuid: Uuid::new_v4(),
             current_server: "lobby".to_string(),
             action_tx: tx,
+            client_ip: "127.0.0.1".to_string(),
+            protocol_version: 765,
         });
 
         let source = ProxyCommandSource {

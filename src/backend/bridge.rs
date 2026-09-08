@@ -17,7 +17,9 @@ use pumpkin_protocol::java::packet_decoder::TCPNetworkDecoder;
 use pumpkin_protocol::java::packet_encoder::TCPNetworkEncoder;
 use pumpkin_protocol::java::server::handshake::SHandShake;
 use pumpkin_protocol::java::server::login::{SLoginPluginResponse, SLoginStart};
-use pumpkin_protocol::java::server::play::{SChatCommand, SCommandSuggestion};
+use pumpkin_protocol::java::server::play::{
+    SChatCommand, SChatMessage, SCommandSuggestion, SCustomPayload,
+};
 use pumpkin_protocol::packet::MultiVersionJavaPacket;
 use pumpkin_protocol::ser::{NetworkReadExt, NetworkReadSliceExt};
 use pumpkin_protocol::{ClientPacket, ConnectionState, ServerPacket};
@@ -37,6 +39,11 @@ use crate::backend::forwarding::{
 use crate::command::{CommandDispatcher, CommandSender, ProxyCommandSource};
 use crate::config::{BackendConfig, Config, ForwardingMode, NetworkConfig};
 use crate::network;
+use crate::plugin::PluginManager;
+use crate::plugin::api::{
+    PlayerChatEvent, PlayerCommandEvent, PlayerDisconnectEvent, PlayerJoinEvent,
+    PluginMessageEvent, ServerConnectEvent, ServerConnectedEvent,
+};
 use crate::security::PacketRateLimiter;
 use crate::session::{PlayerAction, PlayerSession, SessionManager};
 
@@ -87,6 +94,7 @@ pub struct BackendBridge {
     session_manager: Arc<SessionManager>,
     command_dispatcher: Arc<CommandDispatcher>,
     proxy_config: Arc<Config>,
+    plugin_manager: Arc<PluginManager>,
 }
 
 impl BackendBridge {
@@ -106,6 +114,7 @@ impl BackendBridge {
         session_manager: Arc<SessionManager>,
         command_dispatcher: Arc<CommandDispatcher>,
         proxy_config: Arc<Config>,
+        plugin_manager: Arc<PluginManager>,
     ) -> Self {
         Self {
             server_name,
@@ -122,6 +131,7 @@ impl BackendBridge {
             session_manager,
             command_dispatcher,
             proxy_config,
+            plugin_manager,
         }
     }
 
@@ -413,8 +423,39 @@ impl BackendBridge {
 
         let mut current_server_name = self.server_name.clone();
 
+        let mut connect_event = ServerConnectEvent {
+            uuid: self.player.id.to_string(),
+            username: self.player.username.clone(),
+            current_server: None,
+            target_server: current_server_name.clone(),
+            cancelled: false,
+            cancel_reason: None,
+        };
+        self.plugin_manager
+            .fire_server_connect(&mut connect_event)
+            .await;
+        if connect_event.cancelled {
+            let reason = connect_event
+                .cancel_reason
+                .unwrap_or_else(|| "Connection cancelled by plugin".to_string());
+            warn!(
+                "Player '{}' connection to '{}' cancelled by plugin: {}",
+                self.player.username, connect_event.target_server, reason
+            );
+            return Err(BridgeError::VineError(reason));
+        }
+        current_server_name = connect_event.target_server;
+
+        let initial_backend_cfg = if current_server_name == self.server_name {
+            self.config.clone()
+        } else if let Some(cfg) = self.proxy_config.servers.get(&current_server_name) {
+            cfg.clone()
+        } else {
+            self.config.clone()
+        };
+
         let (mut backend_decoder, mut backend_encoder, success_bytes) = match self
-            .login_backend(&current_server_name, &self.config)
+            .login_backend(&current_server_name, &initial_backend_cfg)
             .await
         {
             Ok(res) => res,
@@ -454,12 +495,31 @@ impl BackendBridge {
             self.online_players.load(Ordering::Relaxed)
         );
 
+        let connected_event = ServerConnectedEvent {
+            uuid: self.player.id.to_string(),
+            username: self.player.username.clone(),
+            server_name: current_server_name.clone(),
+        };
+        self.plugin_manager
+            .fire_server_connected(&connected_event)
+            .await;
+
+        let join_event = PlayerJoinEvent {
+            uuid: self.player.id.to_string(),
+            username: self.player.username.clone(),
+            client_ip: self.client_ip.to_string(),
+            initial_server: current_server_name.clone(),
+        };
+        self.plugin_manager.fire_player_join(&join_event).await;
+
         let (action_tx, mut action_rx) = tokio::sync::mpsc::unbounded_channel();
         self.session_manager.register(PlayerSession {
             username: self.player.username.clone(),
             uuid: self.player.id,
             current_server: current_server_name.clone(),
             action_tx: action_tx.clone(),
+            client_ip: self.client_ip.to_string(),
+            protocol_version: self.client_version.protocol_version() as u32,
         });
 
         loop {
@@ -467,8 +527,8 @@ impl BackendBridge {
                 &self.player.username,
                 &mut client_decoder,
                 &mut client_encoder,
-                backend_decoder,
-                backend_encoder,
+                &mut backend_decoder,
+                &mut backend_encoder,
                 self.max_packets_per_sec,
                 self.client_version,
                 &mut action_rx,
@@ -476,6 +536,9 @@ impl BackendBridge {
                 self.command_dispatcher.clone(),
                 self.proxy_config.clone(),
                 self.session_manager.clone(),
+                self.plugin_manager.clone(),
+                self.player.id,
+                current_server_name.clone(),
             )
             .await;
 
@@ -518,6 +581,32 @@ impl BackendBridge {
                         self.player.username, server_name
                     );
 
+                    let mut connect_event = ServerConnectEvent {
+                        uuid: self.player.id.to_string(),
+                        username: self.player.username.clone(),
+                        current_server: Some(current_server_name.clone()),
+                        target_server: server_name.clone(),
+                        cancelled: false,
+                        cancel_reason: None,
+                    };
+                    self.plugin_manager
+                        .fire_server_connect(&mut connect_event)
+                        .await;
+                    if connect_event.cancelled {
+                        let reason = connect_event
+                            .cancel_reason
+                            .as_deref()
+                            .unwrap_or("Server switch cancelled by plugin");
+                        let msg = TextComponent::text(format!("§c{}", reason));
+                        let chat_msg = CSystemChatMessage::new(&msg, false);
+                        if let Ok(bytes) = chat_msg.serialize_packet(&self.client_version) {
+                            let _ = client_encoder.write_packet(bytes).await;
+                            let _ = client_encoder.flush().await;
+                        }
+                        continue;
+                    }
+                    let server_name = connect_event.target_server;
+
                     let target_config = match self.proxy_config.servers.get(&server_name) {
                         Some(cfg) => cfg.clone(),
                         None => {
@@ -552,6 +641,14 @@ impl BackendBridge {
                                 "Player '{}' successfully switched to '{}'",
                                 self.player.username, current_server_name
                             );
+                            let connected_event = ServerConnectedEvent {
+                                uuid: self.player.id.to_string(),
+                                username: self.player.username.clone(),
+                                server_name: current_server_name.clone(),
+                            };
+                            self.plugin_manager
+                                .fire_server_connected(&connected_event)
+                                .await;
                         }
                         Err(e) => {
                             warn!(
@@ -694,6 +791,15 @@ impl BackendBridge {
                 }
             }
         }
+
+        let disconnect_event = PlayerDisconnectEvent {
+            uuid: self.player.id.to_string(),
+            username: self.player.username.clone(),
+            last_server: Some(current_server_name.clone()),
+        };
+        self.plugin_manager
+            .fire_player_disconnect(&disconnect_event)
+            .await;
 
         self.session_manager.unregister(&self.player.username);
         self.online_players.fetch_sub(1, Ordering::Relaxed);
@@ -907,8 +1013,8 @@ impl BackendBridge {
         username: &str,
         client_decoder: &mut TCPNetworkDecoder<R1>,
         client_encoder: &mut TCPNetworkEncoder<W1>,
-        mut backend_decoder: TCPNetworkDecoder<R2>,
-        mut backend_encoder: TCPNetworkEncoder<W2>,
+        backend_decoder: &mut TCPNetworkDecoder<R2>,
+        backend_encoder: &mut TCPNetworkEncoder<W2>,
         max_packets_per_sec: u32,
         client_version: JavaMinecraftVersion,
         action_rx: &mut tokio::sync::mpsc::UnboundedReceiver<PlayerAction>,
@@ -916,6 +1022,9 @@ impl BackendBridge {
         command_dispatcher: Arc<CommandDispatcher>,
         proxy_config: Arc<Config>,
         session_manager: Arc<SessionManager>,
+        plugin_manager: Arc<PluginManager>,
+        player_uuid: uuid::Uuid,
+        current_server_name: String,
     ) -> Result<TunnelExit, BridgeError>
     where
         R1: AsyncRead + Unpin,
@@ -925,6 +1034,8 @@ impl BackendBridge {
     {
         let mut client_rate_limiter = PacketRateLimiter::new(max_packets_per_sec);
         let chat_command_id = SChatCommand::to_id(client_version);
+        let chat_message_id = SChatMessage::to_id(client_version);
+        let custom_payload_id = SCustomPayload::to_id(client_version);
         let command_suggestion_id = SCommandSuggestion::to_id(client_version);
         let command_suggestions_clientbound_id = CCommandSuggestions::to_id(client_version);
         let commands_packet_id = CCommands::to_id(client_version);
@@ -967,8 +1078,22 @@ impl BackendBridge {
                             if let Ok(chat_cmd) = SChatCommand::read(&mut payload, &client_version)
                             {
                                 let cmd_text = chat_cmd.command;
-                                let first_word =
-                                    cmd_text.split_whitespace().next().unwrap_or(cmd_text);
+                                let mut cmd_event = PlayerCommandEvent {
+                                    uuid: player_uuid.to_string(),
+                                    username: username.to_string(),
+                                    command: cmd_text.to_string(),
+                                    cancelled: false,
+                                };
+                                plugin_manager.fire_player_command(&mut cmd_event).await;
+                                if cmd_event.cancelled {
+                                    continue;
+                                }
+
+                                let first_word = cmd_event
+                                    .command
+                                    .split_whitespace()
+                                    .next()
+                                    .unwrap_or(&cmd_event.command);
                                 if command_dispatcher.has_command(first_word) {
                                     let source = ProxyCommandSource {
                                         sender: CommandSender::Player {
@@ -978,7 +1103,43 @@ impl BackendBridge {
                                         config: proxy_config.clone(),
                                         session_manager: session_manager.clone(),
                                     };
-                                    command_dispatcher.handle_command(&source, cmd_text);
+                                    command_dispatcher.handle_command(&source, &cmd_event.command);
+                                    continue;
+                                }
+                            }
+                        }
+
+                        if raw_packet.id == chat_message_id {
+                            let mut payload = &raw_packet.payload[..];
+                            if let Ok(chat_msg) = SChatMessage::read(&mut payload, &client_version)
+                            {
+                                let mut chat_event = PlayerChatEvent {
+                                    uuid: player_uuid.to_string(),
+                                    username: username.to_string(),
+                                    message: chat_msg.message.to_string(),
+                                    cancelled: false,
+                                };
+                                plugin_manager.fire_player_chat(&mut chat_event).await;
+                                if chat_event.cancelled {
+                                    continue;
+                                }
+                            }
+                        }
+
+                        if raw_packet.id == custom_payload_id {
+                            let mut payload = &raw_packet.payload[..];
+                            if let Ok(custom_payload) =
+                                SCustomPayload::read(&mut payload, &client_version)
+                            {
+                                let mut msg_event = PluginMessageEvent {
+                                    channel: custom_payload.channel.to_string(),
+                                    data: custom_payload.data.to_vec(),
+                                    player_uuid: Some(player_uuid.to_string()),
+                                    server_name: Some(current_server_name.clone()),
+                                    cancelled: false,
+                                };
+                                plugin_manager.fire_plugin_message(&mut msg_event).await;
+                                if msg_event.cancelled {
                                     continue;
                                 }
                             }
@@ -1032,9 +1193,8 @@ impl BackendBridge {
                                 // 2. Root command name completion (no space, e.g. "/", "/s", "/ser", "/server")
                                 if !clean_cmd.contains(' ') {
                                     let clean_lower = clean_cmd.to_ascii_lowercase();
-                                    let permitted = command_dispatcher
-                                        .raw()
-                                        .get_all_permitted_commands(&source);
+                                    let permitted =
+                                        command_dispatcher.get_all_permitted_commands(&source);
                                     let proxy_matches: Vec<(String, Option<String>)> = permitted
                                         .into_iter()
                                         .filter(|(cmd_name, _)| cmd_name.starts_with(&clean_lower))
@@ -1171,9 +1331,11 @@ impl BackendBridge {
                                 config: proxy_config.clone(),
                                 session_manager: session_manager.clone(),
                             };
-                            let permitted =
-                                command_dispatcher.raw().get_all_permitted_commands(&source);
-                            let permitted_refs: Vec<(&str, &str)> = permitted.into_iter().collect();
+                            let permitted = command_dispatcher.get_all_permitted_commands(&source);
+                            let permitted_refs: Vec<(&str, &str)> = permitted
+                                .iter()
+                                .map(|(k, v)| (k.as_str(), v.as_str()))
+                                .collect();
 
                             if let Some(modified_payload) = inject_proxy_commands(
                                 &raw_packet.payload,
@@ -1222,6 +1384,25 @@ impl BackendBridge {
                     PlayerAction::Message(text_comp) => {
                         let chat_msg = CSystemChatMessage::new(&text_comp, false);
                         if let Ok(bytes) = chat_msg.serialize_packet(&client_version) {
+                            let _ = client_tx.send(bytes);
+                        }
+                    }
+                    PlayerAction::Disconnect(reason) => {
+                        let text = TextComponent::text(reason.clone());
+                        let disconnect_pkt = CPlayDisconnect::new(&text);
+                        if let Ok(bytes) = disconnect_pkt.serialize_packet(&client_version) {
+                            let _ = client_tx.send(bytes);
+                        }
+                        return TunnelExit::BackendDisconnected {
+                            reason: Some(reason),
+                        };
+                    }
+                    PlayerAction::PluginMessage { channel, data } => {
+                        let custom_payload =
+                            pumpkin_protocol::java::client::play::CCustomPayload::new(
+                                &channel, &data,
+                            );
+                        if let Ok(bytes) = custom_payload.serialize_packet(&client_version) {
                             let _ = client_tx.send(bytes);
                         }
                     }

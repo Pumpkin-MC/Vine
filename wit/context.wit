@@ -1,0 +1,15 @@
+interface context {
+    use types.{event-priority};
+    use event.{event-type};
+
+    resource context {
+        /// Register an event listener for an event type with priority
+        register-event: func(handler-id: u32, event-type: event-type, priority: event-priority);
+
+        /// Register a proxy command
+        register-command: func(command-id: u32, name: string, description: string, aliases: list<string>, permission: option<string>);
+
+        /// Get path to the plugin's data folder (e.g. plugins/data/<plugin-name>)
+        get-data-folder: func() -> string;
+    }
+}
