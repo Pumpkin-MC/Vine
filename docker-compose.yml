@@ -1,0 +1,21 @@
+services:
+  vine:
+    # Make sure to change the tag to the vine version you want to use.
+    # https://github.com/Pumpkin-MC/Vine/pkgs/container/vine/versions?filters%5Bversion_type%5D=tagged
+    #image: ghcr.io/pumpkin-mc/vine:master
+    build: .
+    ports:
+      - "25565:25565"
+      - "19132:19132/udp"
+    volumes:
+      - ./data:/vine
+      # Use the following, if you want to make your config immutable
+      #- ./vine.toml:/vine/vine.toml:ro
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+    cap_drop:
+      - ALL
+    read_only: false

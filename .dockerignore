@@ -1,0 +1,17 @@
+# A whitelist of files that should be included into Docker.
+# Put an exclamation mark before everything to include.
+
+# Ignore everything
+*
+
+# Allow the source code folders
+!/src/
+!/wit/
+!/vine.toml
+
+# Allow build.rs or git sha
+!/.git
+
+# Dependencies
+!Cargo.lock
+!Cargo.toml
