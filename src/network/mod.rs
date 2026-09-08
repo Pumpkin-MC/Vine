@@ -55,13 +55,9 @@ pub fn configure_client_socket(stream: &TcpStream, config: &NetworkConfig) -> io
     let sock = socket2::SockRef::from(stream);
 
     if config.tcp_keepalive_secs > 0 {
-        let mut keepalive =
-            socket2::TcpKeepalive::new().with_time(Duration::from_secs(config.tcp_keepalive_secs));
-
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            keepalive = keepalive.with_interval(Duration::from_secs(10));
-        }
+        let keepalive = socket2::TcpKeepalive::new()
+            .with_time(Duration::from_secs(config.tcp_keepalive_secs))
+            .with_interval(Duration::from_secs(10));
 
         if let Err(e) = sock.set_tcp_keepalive(&keepalive) {
             debug!("Failed to set TCP keepalive on client socket: {}", e);
@@ -87,13 +83,9 @@ pub fn configure_backend_socket(stream: &TcpStream, config: &NetworkConfig) -> i
     let sock = socket2::SockRef::from(stream);
 
     if config.tcp_keepalive_secs > 0 {
-        let mut keepalive =
-            socket2::TcpKeepalive::new().with_time(Duration::from_secs(config.tcp_keepalive_secs));
-
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            keepalive = keepalive.with_interval(Duration::from_secs(10));
-        }
+        let keepalive = socket2::TcpKeepalive::new()
+            .with_time(Duration::from_secs(config.tcp_keepalive_secs))
+            .with_interval(Duration::from_secs(10));
 
         if let Err(e) = sock.set_tcp_keepalive(&keepalive) {
             debug!("Failed to set TCP keepalive on backend socket: {}", e);
