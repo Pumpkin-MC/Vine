@@ -112,7 +112,7 @@ impl Default for Authenticator {
 
 impl Authenticator {
     pub fn new() -> Self {
-        let client = pumpkin_util::client_builder()
+        let client = pumpkin_auth::client_builder()
             .timeout(Duration::from_secs(10))
             .connect_timeout(Duration::from_secs(5))
             .build()

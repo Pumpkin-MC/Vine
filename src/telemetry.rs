@@ -468,7 +468,7 @@ pub fn start_telemetry(
     );
 
     let user_agent = format!("Vine-Proxy/{}", env!("CARGO_PKG_VERSION"));
-    let client = match pumpkin_util::client_builder()
+    let client = match pumpkin_auth::client_builder()
         .timeout(Duration::from_secs(10))
         .user_agent(&user_agent)
         .build()
@@ -805,7 +805,7 @@ mod tests {
         });
 
         let endpoint = format!("http://127.0.0.1:{port}/api/v1/rest/telemetry/heartbeat");
-        let http_client = pumpkin_util::client();
+        let http_client = pumpkin_auth::client();
         let client = TelemetryClient::new(signing_key, http_client, endpoint);
 
         let payload = HeartbeatPayload {
@@ -844,7 +844,7 @@ mod tests {
             .unwrap()
             .as_secs()
             .to_string();
-        let response = pumpkin_util::client()
+        let response = pumpkin_auth::client()
             .post(format!(
                 "http://127.0.0.1:{port}/api/v1/rest/telemetry/heartbeat"
             ))
