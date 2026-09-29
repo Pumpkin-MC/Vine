@@ -271,6 +271,7 @@ mod tests {
             sample_players: vec!["SamplePlayer".to_string()],
             icon_path: Some(icon_path_str),
             show_sample_players: true,
+            ping_passthrough: "DISABLED".to_string(),
         };
 
         let online = Arc::new(AtomicUsize::new(5));
@@ -306,6 +307,7 @@ mod tests {
             sample_players: Vec::new(),
             icon_path: None,
             show_sample_players: false,
+            ping_passthrough: "DISABLED".to_string(),
         };
 
         let online = Arc::new(AtomicUsize::new(0));

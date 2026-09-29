@@ -157,6 +157,10 @@ pub struct NetworkConfig {
     /// Log incoming server list status pings in the console
     #[serde(default)]
     pub log_pings: bool,
+
+    /// Enable BungeeCord / Velocity plugin message channel handling (bungeecord:main)
+    #[serde(default = "default_true")]
+    pub bungee_plugin_message_channel: bool,
 }
 
 impl Default for NetworkConfig {
@@ -175,8 +179,13 @@ impl Default for NetworkConfig {
             listen_backlog: default_listen_backlog(),
             proxy_protocol: false,
             log_pings: false,
+            bungee_plugin_message_channel: true,
         }
     }
+}
+
+fn default_ping_passthrough() -> String {
+    "DISABLED".to_string()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -199,6 +208,9 @@ pub struct MotdConfig {
     /// Whether to show the player sample list on hover in the multiplayer menu
     #[serde(default = "default_true")]
     pub show_sample_players: bool,
+    /// Ping passthrough mode matching Velocity: "DISABLED", "ALL", "DESCRIPTION", "MODS"
+    #[serde(default = "default_ping_passthrough")]
+    pub ping_passthrough: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -223,6 +235,9 @@ pub struct RoutingConfig {
     pub default_server: String,
     /// Fallback server if default server is offline
     pub fallback_server: Option<String>,
+    /// Priority order of servers to try when connecting or falling back (Velocity `try` list)
+    #[serde(default)]
+    pub try_servers: Vec<String>,
     /// Virtual host routing: maps domain/hostname to backend server name
     pub forced_hosts: HashMap<String, String>,
     /// Automatically try fallback server if connection to target server fails
@@ -236,8 +251,10 @@ pub enum ForwardingMode {
     /// Plain connection without forwarding info (for Vanilla servers in offline-mode)
     None,
     /// BungeeCord IP forwarding (for Bukkit, Spigot, PaperMC with bungeecord: true)
+    #[serde(alias = "legacy")]
     BungeeCord,
     /// Velocity modern forwarding with HMAC-SHA256 secret (for PaperMC, Purpur, Pumpkin)
+    #[serde(alias = "modern")]
     Velocity,
     /// Vine modern forwarding with Ed25519 asymmetric signatures, timestamp, and challenge nonce (for Pumpkin)
     Vine,
@@ -365,6 +382,7 @@ impl Default for Config {
                 ],
                 icon_path: None,
                 show_sample_players: true,
+                ping_passthrough: default_ping_passthrough(),
             },
             security: SecurityConfig {
                 rate_limit_enabled: true,
@@ -377,6 +395,7 @@ impl Default for Config {
             routing: RoutingConfig {
                 default_server: "lobby".to_string(),
                 fallback_server: Some("survival".to_string()),
+                try_servers: vec!["lobby".to_string(), "survival".to_string()],
                 forced_hosts,
                 try_fallback_on_connect_failure: true,
             },
@@ -392,12 +411,28 @@ impl Default for Config {
 pub use crate::permissions::{GroupConfig, PermissionsConfig, UserPermissionConfig};
 
 impl Config {
+    /// Loads a configuration from a TOML string, supporting either native Vine syntax or standard Velocity 1:1 syntax.
+    pub fn load_from_str(content: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let val: toml::Value = toml::from_str(content)?;
+        if let toml::Value::Table(ref table) = val
+            && (table.contains_key("bind")
+                || table.contains_key("player-info-forwarding-mode")
+                || table.contains_key("config-version")
+                || table.contains_key("show-max-players"))
+        {
+            let vel: VelocityConfig = toml::from_str(content)?;
+            return Ok(vel.into_config());
+        }
+
+        let config: Config = toml::from_str(content)?;
+        Ok(config)
+    }
+
     pub fn load_or_create<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
         let path = path.as_ref();
         if path.exists() {
             let content = std::fs::read_to_string(path)?;
-            let config: Config = toml::from_str(&content)?;
-            Ok(config)
+            Self::load_from_str(&content)
         } else {
             let default_config = Config::default();
             let toml_string = toml::to_string_pretty(&default_config)?;
@@ -407,9 +442,245 @@ impl Config {
     }
 }
 
+/// 1:1 Velocity configuration layout (`velocity.toml`).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct VelocityConfig {
+    #[serde(default)]
+    pub config_version: Option<String>,
+    #[serde(default)]
+    pub bind: Option<String>,
+    #[serde(default)]
+    pub motd: Option<String>,
+    #[serde(default)]
+    pub show_max_players: Option<u32>,
+    #[serde(default = "default_true")]
+    pub online_mode: bool,
+    #[serde(default)]
+    pub prevent_client_proxy_connections: bool,
+    #[serde(default = "default_velocity_forwarding")]
+    pub player_info_forwarding_mode: String,
+    #[serde(default)]
+    pub forwarding_secret: Option<String>,
+    #[serde(default)]
+    pub announce_forge: bool,
+    #[serde(default = "default_true")]
+    pub kick_to_fallback: bool,
+    #[serde(default = "default_ping_passthrough")]
+    pub ping_passthrough: String,
+    #[serde(default = "default_true")]
+    pub sample_player_list: bool,
+
+    #[serde(default)]
+    pub servers: Option<toml::Table>,
+    #[serde(default)]
+    pub forced_hosts: Option<HashMap<String, toml::Value>>,
+    #[serde(default)]
+    pub advanced: Option<VelocityAdvancedConfig>,
+}
+
+fn default_velocity_forwarding() -> String {
+    "modern".to_string()
+}
+
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct VelocityAdvancedConfig {
+    #[serde(default)]
+    pub compression_threshold: Option<i32>,
+    #[serde(default)]
+    pub compression_level: Option<i32>,
+    #[serde(default)]
+    pub login_ratelimit: Option<u64>,
+    #[serde(default)]
+    pub connection_timeout: Option<u64>,
+    #[serde(default)]
+    pub read_timeout: Option<u64>,
+    #[serde(default)]
+    pub haproxy_protocol: Option<bool>,
+    #[serde(default)]
+    pub tcp_fast_open: Option<bool>,
+    #[serde(default = "default_true")]
+    pub bungee_plugin_message_channel: bool,
+    #[serde(default)]
+    pub show_ping_requests: Option<bool>,
+    #[serde(default = "default_true")]
+    pub failover_on_unexpected_server_disconnect: bool,
+    #[serde(default = "default_true")]
+    pub announce_proxy_commands: bool,
+}
+
+impl VelocityConfig {
+    pub fn into_config(self) -> Config {
+        let mut base = Config::default();
+
+        if let Some(bind) = self.bind {
+            base.server.bind_address = bind;
+        }
+        base.server.online_mode = self.online_mode;
+        base.server.prevent_proxy_connections = self.prevent_client_proxy_connections;
+
+        if let Some(motd) = self.motd {
+            base.motd.line1 = motd;
+            base.motd.line2.clear();
+        }
+        if let Some(max_p) = self.show_max_players {
+            base.motd.max_players = max_p;
+        }
+        base.motd.show_sample_players = self.sample_player_list;
+        base.motd.ping_passthrough = self.ping_passthrough;
+
+        let global_forwarding = match self.player_info_forwarding_mode.to_ascii_lowercase().as_str() {
+            "legacy" | "bungeecord" => ForwardingMode::BungeeCord,
+            "vine" => ForwardingMode::Vine,
+            "none" => ForwardingMode::None,
+            _ => ForwardingMode::Velocity,
+        };
+
+        let global_secret = self.forwarding_secret.clone();
+
+        if let Some(advanced) = self.advanced {
+            if let Some(ct) = advanced.compression_threshold {
+                base.server.compression_threshold = ct;
+            }
+            if let Some(cl) = advanced.compression_level
+                && cl >= 0
+            {
+                base.server.compression_level = cl;
+            }
+            if let Some(ct_ms) = advanced.connection_timeout {
+                base.network.backend_connect_timeout_secs = (ct_ms / 1000).max(1);
+            }
+            if let Some(rt_ms) = advanced.read_timeout {
+                base.network.backend_login_timeout_secs = (rt_ms / 1000).max(1);
+            }
+            if let Some(hp) = advanced.haproxy_protocol {
+                base.network.proxy_protocol = hp;
+            }
+            base.network.bungee_plugin_message_channel = advanced.bungee_plugin_message_channel;
+            base.routing.try_fallback_on_connect_failure =
+                advanced.failover_on_unexpected_server_disconnect;
+        }
+
+        base.routing.try_fallback_on_connect_failure = self.kick_to_fallback;
+
+        if let Some(servers_table) = self.servers {
+            let mut parsed_servers = HashMap::new();
+            let mut try_list = Vec::new();
+
+            for (key, val) in servers_table {
+                if key.eq_ignore_ascii_case("try") {
+                    if let toml::Value::Array(arr) = val {
+                        for item in arr {
+                            if let toml::Value::String(s) = item {
+                                try_list.push(s);
+                            }
+                        }
+                    }
+                } else if let toml::Value::String(addr) = val {
+                    parsed_servers.insert(
+                        key,
+                        BackendConfig {
+                            address: addr,
+                            forwarding: global_forwarding.clone(),
+                            secret: global_secret.clone(),
+                            icon_path: None,
+                            motd_line1: None,
+                            motd_line2: None,
+                        },
+                    );
+                } else if let Ok(cfg) = val.try_into::<BackendConfig>() {
+                    parsed_servers.insert(key, cfg);
+                }
+            }
+
+            if !parsed_servers.is_empty() {
+                base.servers = parsed_servers;
+            }
+
+            if !try_list.is_empty() {
+                base.routing.default_server = try_list[0].clone();
+                base.routing.fallback_server = try_list.get(1).cloned();
+                base.routing.try_servers = try_list;
+            }
+        }
+
+        if let Some(forced) = self.forced_hosts {
+            let mut map = HashMap::new();
+            for (host, val) in forced {
+                if let toml::Value::Array(arr) = val {
+                    if let Some(toml::Value::String(target)) = arr.first() {
+                        map.insert(host, target.clone());
+                    }
+                } else if let toml::Value::String(target) = val {
+                    map.insert(host, target);
+                }
+            }
+            if !map.is_empty() {
+                base.routing.forced_hosts = map;
+            }
+        }
+
+        base
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_velocity_toml_1_to_1_deserialization() {
+        let velocity_toml = r#"
+            config-version = "2.7"
+            bind = "0.0.0.0:25577"
+            motd = "<#09add3>A Velocity Server"
+            show-max-players = 500
+            online-mode = true
+            prevent-client-proxy-connections = false
+            player-info-forwarding-mode = "modern"
+            forwarding-secret = "test-forwarding-secret"
+            announce-forge = false
+            kick-to-fallback = true
+            ping-passthrough = "ALL"
+            sample-player-list = true
+
+            [servers]
+            lobby = "127.0.0.1:30066"
+            factions = "127.0.0.1:30067"
+            try = [
+                "lobby",
+                "factions"
+            ]
+
+            [forced-hosts]
+            "lobby.example.com" = [
+                "lobby"
+            ]
+
+            [advanced]
+            compression-threshold = 256
+            compression-level = -1
+            connection-timeout = 5000
+            read-timeout = 30000
+            bungee-plugin-message-channel = true
+            failover-on-unexpected-server-disconnect = true
+        "#;
+
+        let config = Config::load_from_str(velocity_toml).expect("Failed to parse velocity.toml");
+        assert_eq!(config.server.bind_address, "0.0.0.0:25577");
+        assert_eq!(config.motd.line1, "<#09add3>A Velocity Server");
+        assert_eq!(config.motd.max_players, 500);
+        assert!(config.server.online_mode);
+        assert_eq!(config.routing.default_server, "lobby");
+        assert_eq!(config.routing.fallback_server.as_deref(), Some("factions"));
+        assert_eq!(config.routing.try_servers, vec!["lobby", "factions"]);
+        assert!(config.servers.contains_key("lobby"));
+        assert_eq!(config.servers["lobby"].address, "127.0.0.1:30066");
+        assert_eq!(config.servers["lobby"].forwarding, ForwardingMode::Velocity);
+        assert_eq!(config.routing.forced_hosts.get("lobby.example.com").map(String::as_str), Some("lobby"));
+        assert!(config.network.bungee_plugin_message_channel);
+    }
 
     #[test]
     fn test_telemetry_config_defaults() {

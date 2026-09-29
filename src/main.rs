@@ -18,7 +18,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = std::env::args()
         .nth(1)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("vine.toml"));
+        .unwrap_or_else(|| {
+            if std::path::Path::new("velocity.toml").exists() {
+                PathBuf::from("velocity.toml")
+            } else {
+                PathBuf::from("vine.toml")
+            }
+        });
 
     info!("Loading configuration from '{}'...", config_path.display());
     let config = match Config::load_or_create(&config_path) {

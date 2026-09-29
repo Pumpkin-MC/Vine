@@ -29,6 +29,12 @@ impl Router {
             return Some((self.routing.default_server.clone(), cfg.clone()));
         }
 
+        for try_name in &self.routing.try_servers {
+            if let Some(cfg) = self.servers.get(try_name) {
+                return Some((try_name.clone(), cfg.clone()));
+            }
+        }
+
         if let Some(fallback_name) = &self.routing.fallback_server
             && let Some(cfg) = self.servers.get(fallback_name)
         {
