@@ -34,14 +34,11 @@ jobs:
         toolchain:
           - stable
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
-      - name: Checkout Pumpkin dependency
-        shell: bash
-        run: git clone --depth 1 https://github.com/Pumpkin-MC/Pumpkin.git ../Pumpkin
       - run: rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Install musl-tools (Linux only)
         if: runner.os == 'Linux'
@@ -52,7 +49,7 @@ jobs:
       - name: Build Release
         shell: bash
         run: |
-          cargo build --verbose --release
+          cargo build --verbose --release --locked
           if [ "${{ runner.os }}" == "Linux" ]; then
             if [ "${{ runner.arch }}" == "X64" ]; then
               TARGET="x86_64-unknown-linux-musl"
@@ -60,7 +57,7 @@ jobs:
               TARGET="aarch64-unknown-linux-musl"
             fi
             rustup target add "$TARGET"
-            cargo build --verbose --release --target "$TARGET"
+            cargo build --verbose --release --locked --target "$TARGET"
           fi
 
       - name: Prepare artifacts
@@ -79,18 +76,30 @@ jobs:
             cp "target/$TARGET/release/vine" "dist/vine-${{ runner.arch }}-${{ runner.os }}-musl"
           fi
 
+      # Secrets cannot be read in step conditions; only this step sees the token and it just
+      # records whether one is set, so the build steps never get it
+      - name: Check for SignPath
+        id: signpath
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+        run: |
+          if [ -n "$SIGNPATH_API_TOKEN" ]; then enabled=true; else enabled=false; fi
+          echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
+
       - name: Upload unsigned executable for SignPath (Windows only)
-        if: runner.os == 'Windows' && env.SIGNPATH_API_TOKEN != ''
+        if: steps.signpath.outputs.enabled == 'true'
         id: upload_unsigned
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: unsigned-${{ runner.arch }}-${{ runner.os }}
           path: dist/vine-*
           retention-days: 1
 
       - name: Submit SignPath signing request (Windows only)
-        if: runner.os == 'Windows' && env.SIGNPATH_API_TOKEN != ''
-        uses: signpath/github-action-submit-signing-request@v2
+        if: steps.signpath.outputs.enabled == 'true'
+        uses: signpath/github-action-submit-signing-request@c92b958760219087e01f8d67a1669ed57afe2627 # v2.3
         with:
           api-token: '${{ secrets.SIGNPATH_API_TOKEN }}'
           organization-id: '${{ secrets.SIGNPATH_ORGANIZATION_ID }}'
@@ -101,14 +110,14 @@ jobs:
           output-artifact-directory: dist/signed/
 
       - name: Overwrite with signed version (Windows only)
-        if: runner.os == 'Windows' && env.SIGNPATH_API_TOKEN != ''
+        if: steps.signpath.outputs.enabled == 'true'
         shell: bash
         run: |
           cp dist/signed/* dist/
           rm -rf dist/signed/
 
       - name: Export executable
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vine-${{ runner.arch }}-${{ runner.os }}
           compression-level: 9
@@ -121,18 +130,23 @@ jobs:
     needs: [build_release]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
 
       - name: Determine tag name
         id: tag
         shell: bash
+        # Inputs go through the environment so their text is never run as part of the script
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          if [ -n "${{ github.event.inputs.tag_name }}" ]; then
-            TAG="${{ github.event.inputs.tag_name }}"
-          elif [ "${{ github.ref_type }}" == "tag" ]; then
-            TAG="${{ github.ref_name }}"
+          if [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+          elif [ "$REF_TYPE" == "tag" ]; then
+            TAG="$REF_NAME"
           else
             VERSION=$(awk -F '"' '/^version/ {print $2}' Cargo.toml)
             TAG="${VERSION}"
@@ -141,7 +155,7 @@ jobs:
           echo "Determined release tag: ${TAG}"
 
       - name: Download prebuilt binary artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: "vine-*"
           path: dist/
@@ -155,7 +169,7 @@ jobs:
           cat checksums.sha256
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ steps.tag.outputs.tag_name }}
           name: Release ${{ steps.tag.outputs.tag_name }}
