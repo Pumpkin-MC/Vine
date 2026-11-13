@@ -16,9 +16,11 @@ use pumpkin_protocol::java::client::play::{
 use pumpkin_protocol::java::packet_decoder::TCPNetworkDecoder;
 use pumpkin_protocol::java::packet_encoder::TCPNetworkEncoder;
 use pumpkin_protocol::java::server::handshake::SHandShake;
-use pumpkin_protocol::java::server::login::{SLoginPluginResponse, SLoginStart};
+use pumpkin_protocol::java::server::login::{
+    SLoginAcknowledged, SLoginPluginResponse, SLoginStart,
+};
 use pumpkin_protocol::java::server::play::{
-    SChatCommand, SChatMessage, SCommandSuggestion, SCustomPayload,
+    SChatCommand, SChatMessage, SCommandSuggestion, SConfigurationAcknowledged, SCustomPayload,
 };
 use pumpkin_protocol::packet::MultiVersionJavaPacket;
 use pumpkin_protocol::ser::{NetworkReadExt, NetworkReadSliceExt};
@@ -406,6 +408,32 @@ impl BackendBridge {
         }
     }
 
+    /// Moves the client into the configuration state for a backend it is switching to.
+    /// See [`reenter_configuration`].
+    async fn reenter_configuration<R, W, B>(
+        &self,
+        server_name: &str,
+        client_decoder: &mut TCPNetworkDecoder<R>,
+        client_encoder: &mut TCPNetworkEncoder<W>,
+        backend_encoder: &mut TCPNetworkEncoder<B>,
+    ) -> Result<(), BridgeError>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+        B: AsyncWrite + Unpin,
+    {
+        reenter_configuration(
+            self.client_version,
+            Duration::from_secs(self.network_config.backend_login_timeout_secs),
+            &self.player.username,
+            server_name,
+            client_decoder,
+            client_encoder,
+            backend_encoder,
+        )
+        .await
+    }
+
     /// Establishes connection to backend, handles login handshake, and tunnels packets
     pub async fn run<R, W>(
         self,
@@ -624,13 +652,21 @@ impl BackendBridge {
                     };
 
                     match self.login_backend(&server_name, &target_config).await {
-                        Ok((new_dec, new_enc, _)) => {
-                            if self.client_version >= JavaMinecraftVersion::V_1_20_2
-                                && let Ok(bytes) =
-                                    CStartConfiguration.serialize_packet(&self.client_version)
+                        Ok((new_dec, mut new_enc, _)) => {
+                            if let Err(e) = self
+                                .reenter_configuration(
+                                    &server_name,
+                                    &mut client_decoder,
+                                    &mut client_encoder,
+                                    &mut new_enc,
+                                )
+                                .await
                             {
-                                let _ = client_encoder.write_packet(bytes).await;
-                                let _ = client_encoder.flush().await;
+                                warn!(
+                                    "Player '{}' did not finish switching to '{}': {}",
+                                    self.player.username, server_name, e
+                                );
+                                break;
                             }
                             backend_decoder = new_dec;
                             backend_encoder = new_enc;
@@ -673,13 +709,21 @@ impl BackendBridge {
                             if can_fallback {
                                 let (fb_name, fb_cfg) = self.fallback_server.as_ref().unwrap();
                                 match self.login_backend(fb_name, fb_cfg).await {
-                                    Ok((new_dec, new_enc, _)) => {
-                                        if self.client_version >= JavaMinecraftVersion::V_1_20_2
-                                            && let Ok(bytes) = CStartConfiguration
-                                                .serialize_packet(&self.client_version)
+                                    Ok((new_dec, mut new_enc, _)) => {
+                                        if let Err(e) = self
+                                            .reenter_configuration(
+                                                fb_name,
+                                                &mut client_decoder,
+                                                &mut client_encoder,
+                                                &mut new_enc,
+                                            )
+                                            .await
                                         {
-                                            let _ = client_encoder.write_packet(bytes).await;
-                                            let _ = client_encoder.flush().await;
+                                            warn!(
+                                                "Player '{}' did not finish switching to '{}': {}",
+                                                self.player.username, fb_name, e
+                                            );
+                                            break;
                                         }
                                         backend_decoder = new_dec;
                                         backend_encoder = new_enc;
@@ -740,13 +784,21 @@ impl BackendBridge {
                         }
 
                         match self.login_backend(fb_name, fb_cfg).await {
-                            Ok((new_dec, new_enc, _)) => {
-                                if self.client_version >= JavaMinecraftVersion::V_1_20_2
-                                    && let Ok(bytes) =
-                                        CStartConfiguration.serialize_packet(&self.client_version)
+                            Ok((new_dec, mut new_enc, _)) => {
+                                if let Err(e) = self
+                                    .reenter_configuration(
+                                        fb_name,
+                                        &mut client_decoder,
+                                        &mut client_encoder,
+                                        &mut new_enc,
+                                    )
+                                    .await
                                 {
-                                    let _ = client_encoder.write_packet(bytes).await;
-                                    let _ = client_encoder.flush().await;
+                                    warn!(
+                                        "Player '{}' did not finish switching to '{}': {}",
+                                        self.player.username, fb_name, e
+                                    );
+                                    break;
                                 }
                                 backend_decoder = new_dec;
                                 backend_encoder = new_enc;
@@ -845,6 +897,71 @@ struct PendingSuggestion {
     clean_cmd: String,
     offset: usize,
     proxy_matches: Vec<(String, Option<String>)>,
+}
+
+/// Moves a client into the configuration state for a backend it is switching to.
+///
+/// `login_backend` stops at Login Success, so the new backend is still in the login state, waiting
+/// for Login Acknowledged. A 1.20.2+ client in play answers Start Configuration with Configuration
+/// Acknowledged. That is when the login is acknowledged on the backend, instead of passing the
+/// client's packet through, which the backend can't handle in the login state. Play packets the
+/// client sends before its acknowledgement are dropped, as they belong to the old server.
+async fn reenter_configuration<R, W, B>(
+    client_version: JavaMinecraftVersion,
+    wait: Duration,
+    username: &str,
+    server_name: &str,
+    client_decoder: &mut TCPNetworkDecoder<R>,
+    client_encoder: &mut TCPNetworkEncoder<W>,
+    backend_encoder: &mut TCPNetworkEncoder<B>,
+) -> Result<(), BridgeError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    B: AsyncWrite + Unpin,
+{
+    if client_version < JavaMinecraftVersion::V_1_20_2 {
+        return Ok(());
+    }
+
+    let start = CStartConfiguration
+        .serialize_packet(&client_version)
+        .map_err(|e| BridgeError::EncodeError(e.to_string()))?;
+    client_encoder
+        .write_packet(start)
+        .await
+        .map_err(|e| BridgeError::EncodeError(e.to_string()))?;
+    client_encoder
+        .flush()
+        .await
+        .map_err(|e| BridgeError::EncodeError(e.to_string()))?;
+
+    let acknowledged_id = SConfigurationAcknowledged::to_id(client_version);
+    loop {
+        let packet = timeout(wait, client_decoder.get_raw_packet())
+            .await
+            .map_err(|_| BridgeError::LoginTimeout(server_name.to_string()))?
+            .map_err(|e| BridgeError::DecodeError(e.to_string()))?;
+        if packet.id == acknowledged_id {
+            break;
+        }
+        debug!(
+            "Dropping play packet {} from '{}' while switching to '{}'",
+            packet.id, username, server_name
+        );
+    }
+
+    let acknowledged = SLoginAcknowledged
+        .serialize_packet(&client_version)
+        .map_err(|e| BridgeError::EncodeError(e.to_string()))?;
+    backend_encoder
+        .write_packet(acknowledged)
+        .await
+        .map_err(|e| BridgeError::EncodeError(e.to_string()))?;
+    backend_encoder
+        .flush()
+        .await
+        .map_err(|e| BridgeError::EncodeError(e.to_string()))
 }
 
 fn decode_backend_suggestions(
@@ -1426,6 +1543,87 @@ impl BackendBridge {
 mod tests {
     use super::*;
     use pumpkin_protocol::java::client::play::CommandSuggestion;
+
+    fn packet_bytes(id: i32, payload: &[u8]) -> Bytes {
+        let mut buf = Vec::new();
+        let _ = VarInt(id).encode(&mut buf);
+        buf.extend_from_slice(payload);
+        Bytes::from(buf)
+    }
+
+    #[tokio::test]
+    async fn switch_acknowledges_login_once_client_reenters_configuration() {
+        let version = JavaMinecraftVersion::V_26_3;
+        // proxy <-> client and proxy <-> new backend, as in-memory pipes
+        let (proxy_client_side, client_side) = tokio::io::duplex(4096);
+        let (proxy_backend_side, backend_side) = tokio::io::duplex(4096);
+        let (proxy_client_read, proxy_client_write) = tokio::io::split(proxy_client_side);
+        let (client_read, client_write) = tokio::io::split(client_side);
+        let (_, proxy_backend_write) = tokio::io::split(proxy_backend_side);
+        let (backend_read, _) = tokio::io::split(backend_side);
+
+        let mut client_decoder = TCPNetworkDecoder::new(proxy_client_read);
+        let mut client_encoder = TCPNetworkEncoder::new(proxy_client_write);
+        let mut backend_encoder = TCPNetworkEncoder::new(proxy_backend_write);
+
+        // The client is still in play: one stray play packet, then its acknowledgement.
+        let mut client = TCPNetworkEncoder::new(client_write);
+        client
+            .write_packet(packet_bytes(0x1A, &[1, 2, 3]))
+            .await
+            .unwrap();
+        client
+            .write_packet(
+                SConfigurationAcknowledged
+                    .serialize_packet(&version)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+
+        reenter_configuration(
+            version,
+            Duration::from_secs(5),
+            "tester",
+            "game",
+            &mut client_decoder,
+            &mut client_encoder,
+            &mut backend_encoder,
+        )
+        .await
+        .unwrap();
+
+        let mut client_view = TCPNetworkDecoder::new(client_read);
+        let to_client = client_view.get_raw_packet().await.unwrap();
+        assert_eq!(to_client.id, CStartConfiguration::to_id(version));
+
+        let mut backend_view = TCPNetworkDecoder::new(backend_read);
+        let to_backend = backend_view.get_raw_packet().await.unwrap();
+        assert_eq!(to_backend.id, SLoginAcknowledged::to_id(version));
+        assert!(to_backend.payload.is_empty());
+    }
+
+    #[tokio::test]
+    async fn switch_leaves_pre_configuration_clients_alone() {
+        let version = JavaMinecraftVersion::V_1_20;
+        let (proxy_client_side, _client_side) = tokio::io::duplex(4096);
+        let (proxy_backend_side, _backend_side) = tokio::io::duplex(4096);
+        let (proxy_client_read, proxy_client_write) = tokio::io::split(proxy_client_side);
+        let (_, proxy_backend_write) = tokio::io::split(proxy_backend_side);
+
+        reenter_configuration(
+            version,
+            Duration::from_millis(100),
+            "tester",
+            "game",
+            &mut TCPNetworkDecoder::new(proxy_client_read),
+            &mut TCPNetworkEncoder::new(proxy_client_write),
+            &mut TCPNetworkEncoder::new(proxy_backend_write),
+        )
+        .await
+        .unwrap();
+    }
 
     #[test]
     fn test_decode_backend_suggestions() {

@@ -1,17 +1,40 @@
-use std::io::Cursor;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-
-use pumpkin_protocol::bedrock::status::{
-    CUnconnectedPong, OFFLINE_MESSAGE_MAGIC, SUnconnectedPing, SUnconnectedPingOpenConnections,
-};
-use pumpkin_protocol::serial::{PacketRead, PacketWrite};
 
 use crate::bedrock::config::BedrockConfig;
 
 pub const RAKNET_UNCONNECTED_PING_ID: u8 = 0x01;
 pub const RAKNET_UNCONNECTED_PING_OPEN_ID: u8 = 0x02;
 pub const RAKNET_UNCONNECTED_PONG_ID: u8 = 0x1c;
+
+/// Magic byte sequence in RakNet offline message headers.
+///
+/// Pumpkin dropped RakNet in favour of NetherNet, so Vine keeps the few bytes
+/// of the unconnected ping/pong format it needs for the server list itself.
+pub const OFFLINE_MESSAGE_MAGIC: [u8; 16] = [
+    0x00, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe, 0xfd, 0xfd, 0xfd, 0xfd, 0x12, 0x34, 0x56, 0x78,
+];
+
+/// Reads the client time and magic from an unconnected ping payload
+/// (`time: u64 BE`, `magic: [u8; 16]`, `client_guid: u64 BE`).
+fn read_unconnected_ping(payload: &[u8]) -> Option<(u64, [u8; 16])> {
+    let time = u64::from_be_bytes(payload.get(0..8)?.try_into().ok()?);
+    let magic: [u8; 16] = payload.get(8..24)?.try_into().ok()?;
+    payload.get(24..32)?;
+    Some((time, magic))
+}
+
+/// Writes an unconnected pong payload
+/// (`time: u64 BE`, `server_guid: u64 BE`, magic, `u16 BE` length, advertisement).
+fn write_unconnected_pong(out: &mut Vec<u8>, time: u64, server_guid: u64, ad: &str) -> Option<()> {
+    let length = u16::try_from(ad.len()).ok()?;
+    out.extend_from_slice(&time.to_be_bytes());
+    out.extend_from_slice(&server_guid.to_be_bytes());
+    out.extend_from_slice(&OFFLINE_MESSAGE_MAGIC);
+    out.extend_from_slice(&length.to_be_bytes());
+    out.extend_from_slice(ad.as_bytes());
+    Some(())
+}
 
 /// Handler for Bedrock RakNet status pings.
 pub struct BedrockStatusHandler {
@@ -66,15 +89,8 @@ impl BedrockStatusHandler {
         let (&packet_id, payload) = data.split_first()?;
 
         let (time, magic) = match packet_id {
-            RAKNET_UNCONNECTED_PING_ID => {
-                let mut cursor = Cursor::new(payload);
-                let ping = SUnconnectedPing::read(&mut cursor).ok()?;
-                (ping.time, ping.magic)
-            }
-            RAKNET_UNCONNECTED_PING_OPEN_ID => {
-                let mut cursor = Cursor::new(payload);
-                let ping = SUnconnectedPingOpenConnections::read(&mut cursor).ok()?;
-                (ping.time, ping.magic)
+            RAKNET_UNCONNECTED_PING_ID | RAKNET_UNCONNECTED_PING_OPEN_ID => {
+                read_unconnected_ping(payload)?
             }
             _ => return None,
         };
@@ -84,10 +100,8 @@ impl BedrockStatusHandler {
         }
 
         let ad = self.build_advertisement_string();
-        let pong = CUnconnectedPong::new(time, self.server_guid, ad);
-
         let mut response = vec![RAKNET_UNCONNECTED_PONG_ID];
-        pong.write(&mut response).ok()?;
+        write_unconnected_pong(&mut response, time, self.server_guid, &ad)?;
         Some(response)
     }
 
