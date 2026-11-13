@@ -1,6 +1,6 @@
 use num_bigint::BigInt;
 use pumpkin_protocol::Property;
-use rsa::{Pkcs1v15Encrypt, RsaPrivateKey, pkcs8::EncodePublicKey};
+use rsa::{Pkcs1v15Encrypt, PrivateKey, pkcs8::EncodePublicKey};
 use serde::Deserialize;
 use sha1::{Digest, Sha1};
 use std::{net::IpAddr, time::Duration};
@@ -25,7 +25,7 @@ pub enum AuthError {
 }
 
 pub struct KeyStore {
-    private_key: RsaPrivateKey,
+    private_key: PrivateKey,
     public_key_der: Box<[u8]>,
 }
 
@@ -33,7 +33,7 @@ impl KeyStore {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let mut rng = rand::rng();
         info!("Generating 1024-bit RSA keypair for proxy encryption...");
-        let private_key = RsaPrivateKey::new(&mut rng, 1024)?;
+        let private_key = PrivateKey::new(&mut rng, 1024)?;
         let public_key = private_key.to_public_key();
         let public_key_der = public_key
             .to_public_key_der()

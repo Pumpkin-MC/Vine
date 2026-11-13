@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use pumpkin_plugin_runtime::{RuntimeSpawner, SpawnError, SpawnFuture, StoreExecutor};
+use pumpkin_plugin_runtime::{RuntimeSpawner, SpawnError, SpawnFuture, StoreExecutor, StoreMode};
 use wasmtime::Store;
 
 use super::state::PluginHostState;
@@ -37,5 +37,7 @@ pub async fn start_legacy_store(
     policy: LegacySyncReentry,
     spawner: Arc<dyn RuntimeSpawner>,
 ) -> wasmtime::Result<LegacyStore> {
-    StoreExecutor::start(store, policy, spawner).await
+    // Vine's engine enables Wasmtime concurrency (see `wasm_host/mod.rs`), so
+    // calls run on the concurrent event loop.
+    StoreExecutor::start(store, policy, spawner, StoreMode::Concurrent).await
 }
