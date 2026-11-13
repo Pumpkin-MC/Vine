@@ -251,13 +251,8 @@ impl PluginRuntime {
         let weak = Arc::downgrade(&wasm_plugin);
         wasm_plugin
             .store
-            .call(move |accessor| {
-                Box::pin(async move {
-                    accessor.with(|mut store| {
-                        store.data_mut().plugin = Some(weak);
-                    });
-                    Ok(())
-                })
+            .call(move |state| {
+                state.plugin = Some(weak);
             })
             .await
             .map_err(PluginInitError::InstantiationFailed)?;
