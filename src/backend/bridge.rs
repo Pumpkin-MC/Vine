@@ -18,7 +18,7 @@ use pumpkin_protocol::java::packet_encoder::TCPNetworkEncoder;
 use pumpkin_protocol::java::server::handshake::SHandShake;
 use pumpkin_protocol::java::server::login::{SLoginPluginResponse, SLoginStart};
 use pumpkin_protocol::java::server::play::{
-    SChatCommand, SChatMessage, SCommandSuggestion, SCustomPayload,
+    SChatCommand, SChatCommandSigned, SChatMessage, SCommandSuggestion, SCustomPayload,
 };
 use pumpkin_protocol::packet::MultiVersionJavaPacket;
 use pumpkin_protocol::ser::{NetworkReadExt, NetworkReadSliceExt};
@@ -1034,6 +1034,7 @@ impl BackendBridge {
     {
         let mut client_rate_limiter = PacketRateLimiter::new(max_packets_per_sec);
         let chat_command_id = SChatCommand::to_id(client_version);
+        let chat_command_signed_id = SChatCommandSigned::to_id(client_version);
         let chat_message_id = SChatMessage::to_id(client_version);
         let custom_payload_id = SCustomPayload::to_id(client_version);
         let command_suggestion_id = SCommandSuggestion::to_id(client_version);
@@ -1073,42 +1074,51 @@ impl BackendBridge {
                             return TunnelExit::ClientDisconnected;
                         }
 
-                        if raw_packet.id == chat_command_id {
+                        // Clients send `chat_command_signed` instead of `chat_command`
+                        // when the command has signed arguments; Geyser always does.
+                        let command = if raw_packet.id == chat_command_id {
                             let mut payload = &raw_packet.payload[..];
-                            if let Ok(chat_cmd) = SChatCommand::read(&mut payload, &client_version)
-                            {
-                                let cmd_text = chat_cmd.command;
-                                let mut cmd_event = PlayerCommandEvent {
-                                    uuid: player_uuid.to_string(),
-                                    username: username.to_string(),
-                                    command: cmd_text.to_string(),
-                                    cancelled: false,
-                                };
-                                plugin_manager.fire_player_command(&mut cmd_event).await;
-                                if cmd_event.cancelled {
-                                    continue;
-                                }
+                            SChatCommand::read(&mut payload, &client_version)
+                                .ok()
+                                .map(|packet| packet.command)
+                        } else if raw_packet.id == chat_command_signed_id {
+                            let mut payload = &raw_packet.payload[..];
+                            SChatCommandSigned::read(&mut payload, &client_version)
+                                .ok()
+                                .map(|packet| packet.command)
+                        } else {
+                            None
+                        };
+                        if let Some(cmd_text) = command {
+                            let mut cmd_event = PlayerCommandEvent {
+                                uuid: player_uuid.to_string(),
+                                username: username.to_string(),
+                                command: cmd_text.to_string(),
+                                cancelled: false,
+                            };
+                            plugin_manager.fire_player_command(&mut cmd_event).await;
+                            if cmd_event.cancelled {
+                                continue;
+                            }
 
-                                let first_word = cmd_event
-                                    .command
-                                    .split_whitespace()
-                                    .next()
-                                    .unwrap_or(&cmd_event.command);
-                                if command_dispatcher.has_command(first_word) {
-                                    let source = ProxyCommandSource {
-                                        sender: CommandSender::Player {
-                                            username: username.to_string(),
-                                            action_tx: action_tx.clone(),
-                                        },
-                                        config: proxy_config.clone(),
-                                        session_manager: session_manager.clone(),
-                                    };
-                                    command_dispatcher.handle_command(&source, &cmd_event.command);
-                                    continue;
-                                }
+                            let first_word = cmd_event
+                                .command
+                                .split_whitespace()
+                                .next()
+                                .unwrap_or(&cmd_event.command);
+                            if command_dispatcher.has_command(first_word) {
+                                let source = ProxyCommandSource {
+                                    sender: CommandSender::Player {
+                                        username: username.to_string(),
+                                        action_tx: action_tx.clone(),
+                                    },
+                                    config: proxy_config.clone(),
+                                    session_manager: session_manager.clone(),
+                                };
+                                command_dispatcher.handle_command(&source, &cmd_event.command);
+                                continue;
                             }
                         }
-
                         if raw_packet.id == chat_message_id {
                             let mut payload = &raw_packet.payload[..];
                             if let Ok(chat_msg) = SChatMessage::read(&mut payload, &client_version)
