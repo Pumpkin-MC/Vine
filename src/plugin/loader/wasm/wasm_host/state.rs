@@ -226,7 +226,7 @@ impl wit::vine::plugin::proxy::Host for PluginHostState {
         if let Some(proxy) = &self.proxy {
             let sessions = proxy.session_manager.list_sessions();
             let mut list = Vec::new();
-            for (name, srv) in &proxy.config.servers {
+            for (name, srv) in proxy.config.servers.iter() {
                 let player_count = sessions
                     .iter()
                     .filter(|s| s.current_server == *name)
@@ -315,6 +315,80 @@ impl wit::vine::plugin::proxy::Host for PluginHostState {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    async fn register_server(
+        &mut self,
+        name: String,
+        address: String,
+        forwarding: wit::vine::plugin::types::ForwardingMode,
+        secret: Option<String>,
+    ) -> wasmtime::Result<bool> {
+        use crate::config::{BackendConfig, ForwardingMode};
+        use wit::vine::plugin::types::ForwardingMode as WitForwarding;
+
+        let Some(proxy) = &self.proxy else {
+            return Ok(false);
+        };
+        let forwarding = match forwarding {
+            WitForwarding::None => ForwardingMode::None,
+            WitForwarding::Bungeecord => ForwardingMode::BungeeCord,
+            WitForwarding::Velocity => ForwardingMode::Velocity,
+            WitForwarding::Vine => ForwardingMode::Vine,
+        };
+        let needs_secret = matches!(forwarding, ForwardingMode::Velocity | ForwardingMode::Vine);
+        if name.trim().is_empty()
+            || address.trim().is_empty()
+            || (needs_secret && secret.as_deref().is_none_or(str::is_empty))
+        {
+            return Ok(false);
+        }
+        tracing::info!("Plugin registered backend server '{}' at {}", name, address);
+        proxy.config.servers.insert(
+            name,
+            BackendConfig {
+                address,
+                forwarding,
+                secret,
+                icon_path: None,
+                motd_line1: None,
+                motd_line2: None,
+            },
+        );
+        Ok(true)
+    }
+
+    async fn unregister_server(&mut self, name: String) -> wasmtime::Result<bool> {
+        let Some(proxy) = &self.proxy else {
+            return Ok(false);
+        };
+        let removed = proxy.config.servers.remove(&name).is_some();
+        if removed {
+            tracing::info!("Plugin unregistered backend server '{}'", name);
+        }
+        Ok(removed)
+    }
+
+    async fn set_draining(&mut self, draining: bool) -> wasmtime::Result<()> {
+        if let Some(proxy) = &self.proxy {
+            proxy.config.runtime.set_draining(draining);
+            tracing::info!(
+                "Proxy {} new logins",
+                if draining {
+                    "stopped accepting"
+                } else {
+                    "resumed accepting"
+                }
+            );
+        }
+        Ok(())
+    }
+
+    async fn is_draining(&mut self) -> wasmtime::Result<bool> {
+        Ok(self
+            .proxy
+            .as_ref()
+            .is_some_and(|proxy| proxy.config.runtime.is_draining()))
     }
 
     async fn send_plugin_message(

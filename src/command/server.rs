@@ -42,7 +42,7 @@ impl CommandExecutor<ProxyCommandSource> for ServerInfoCommandExecutor {
             ));
         }
 
-        let mut available: Vec<&String> = context.source.config.servers.keys().collect();
+        let mut available: Vec<String> = context.source.config.servers.keys().collect();
         available.sort();
         let servers_str = available
             .iter()
@@ -110,16 +110,12 @@ impl CommandExecutor<ProxyCommandSource> for ServerSwitchCommandExecutor {
         {
             Some(name) => name.clone(),
             None => {
-                let mut available: Vec<&String> = context.source.config.servers.keys().collect();
+                let mut available: Vec<String> = context.source.config.servers.keys().collect();
                 available.sort();
                 return Err(command_error(format!(
                     "Unknown server '{}'. Available servers: [{}]",
                     server_name,
-                    available
-                        .into_iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    available.join(", ")
                 )));
             }
         };

@@ -13,6 +13,14 @@ interface types {
         player-count: u32,
     }
 
+    /// How Vine forwards a player's identity to a backend server.
+    enum forwarding-mode {
+        none,
+        bungeecord,
+        velocity,
+        vine,
+    }
+
     enum event-priority {
         lowest,
         low,

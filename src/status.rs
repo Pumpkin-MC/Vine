@@ -9,7 +9,7 @@ use pumpkin_util::version::JavaMinecraftVersion;
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::config::{BackendConfig, MotdConfig};
+use crate::config::MotdConfig;
 pub use icon::{StatusIcon, StatusIconManager};
 
 #[derive(Serialize)]
@@ -51,7 +51,7 @@ pub struct StatusHandler {
     motd: MotdConfig,
     online_players: Arc<AtomicUsize>,
     icon_manager: Arc<StatusIconManager>,
-    servers: HashMap<String, BackendConfig>,
+    servers: crate::backend::ServerRegistry,
     forced_hosts: HashMap<String, String>,
 }
 
@@ -60,7 +60,7 @@ impl StatusHandler {
         motd: MotdConfig,
         online_players: Arc<AtomicUsize>,
         icon_manager: Arc<StatusIconManager>,
-        servers: HashMap<String, BackendConfig>,
+        servers: crate::backend::ServerRegistry,
         forced_hosts: HashMap<String, String>,
     ) -> Self {
         Self {
@@ -222,7 +222,7 @@ impl StatusHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ForwardingMode;
+    use crate::config::{BackendConfig, ForwardingMode};
 
     #[test]
     fn test_status_response_with_icon_and_virtual_hosts() {
@@ -274,7 +274,7 @@ mod tests {
         };
 
         let online = Arc::new(AtomicUsize::new(5));
-        let handler = StatusHandler::new(motd, online, icon_mgr, servers, forced_hosts);
+        let handler = StatusHandler::new(motd, online, icon_mgr, servers.into(), forced_hosts);
 
         let global_json = handler.build_status_response(JavaMinecraftVersion::V_26_2, None);
         assert!(global_json.contains("Global Line 1\\nGlobal Line 2"));
@@ -309,7 +309,13 @@ mod tests {
         };
 
         let online = Arc::new(AtomicUsize::new(0));
-        let handler = StatusHandler::new(motd, online, icon_mgr, HashMap::new(), HashMap::new());
+        let handler = StatusHandler::new(
+            motd,
+            online,
+            icon_mgr,
+            HashMap::new().into(),
+            HashMap::new(),
+        );
 
         let json = handler.build_status_response(JavaMinecraftVersion::V_26_2, None);
         assert!(!json.contains("favicon"));

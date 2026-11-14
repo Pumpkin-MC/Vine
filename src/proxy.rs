@@ -133,7 +133,7 @@ impl ProxyServer {
             "  Configured backend servers: {}",
             self.config.servers.len()
         );
-        for (name, server) in &self.config.servers {
+        for (name, server) in self.config.servers.iter() {
             let icon_info = server.icon_path.as_deref().unwrap_or("none");
             info!(
                 "    - [{}] {} (Forwarding: {:?}, Icon: {})",

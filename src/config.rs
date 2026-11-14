@@ -1,5 +1,12 @@
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 fn default_true() -> bool {
     true
@@ -53,7 +60,8 @@ pub struct Config {
     pub motd: MotdConfig,
     pub security: SecurityConfig,
     pub routing: RoutingConfig,
-    pub servers: HashMap<String, BackendConfig>,
+    /// Seeded from `[servers]`; plugins can add and remove servers at runtime.
+    pub servers: crate::backend::ServerRegistry,
     #[serde(default)]
     pub telemetry: TelemetryConfig,
     #[serde(default)]
@@ -62,6 +70,28 @@ pub struct Config {
     pub permissions: PermissionsConfig,
     #[serde(default)]
     pub plugins: PluginConfig,
+    /// Switches changed while the proxy runs. Not part of the file; shared by
+    /// every clone of the config.
+    #[serde(skip)]
+    pub runtime: RuntimeState,
+}
+
+/// Runtime switches shared by every clone of [`Config`].
+#[derive(Clone, Debug, Default)]
+pub struct RuntimeState {
+    draining: Arc<AtomicBool>,
+}
+
+impl RuntimeState {
+    /// Whether the proxy refuses new logins, so it can be emptied before it stops.
+    #[must_use]
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::Acquire)
+    }
+
+    pub fn set_draining(&self, draining: bool) {
+        self.draining.store(draining, Ordering::Release);
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -380,11 +410,12 @@ impl Default for Config {
                 forced_hosts,
                 try_fallback_on_connect_failure: true,
             },
-            servers,
+            servers: servers.into(),
             telemetry: TelemetryConfig::default(),
             bedrock: crate::bedrock::BedrockConfig::default(),
             permissions: PermissionsConfig::default(),
             plugins: PluginConfig::default(),
+            runtime: RuntimeState::default(),
         }
     }
 }

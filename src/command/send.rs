@@ -93,16 +93,12 @@ impl CommandExecutor<ProxyCommandSource> for SendCommandExecutor {
         {
             Some(name) => name.clone(),
             None => {
-                let mut available: Vec<&String> = context.source.config.servers.keys().collect();
+                let mut available: Vec<String> = context.source.config.servers.keys().collect();
                 available.sort();
                 return Err(command_error(format!(
                     "Unknown backend server '{}'. Available servers: [{}]",
                     server_name,
-                    available
-                        .into_iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    available.join(", ")
                 )));
             }
         };
@@ -185,7 +181,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_command_execution() {
-        let mut config = Config::default();
+        let config = Config::default();
         config.servers.insert(
             "survival".to_string(),
             BackendConfig {
@@ -271,7 +267,7 @@ mod tests {
 
     #[test]
     fn test_send_command_offline_player() {
-        let mut config = Config::default();
+        let config = Config::default();
         config.servers.insert(
             "survival".to_string(),
             BackendConfig {
@@ -304,7 +300,7 @@ mod tests {
 
     #[test]
     fn test_send_command_suggestions() {
-        let mut config = Config::default();
+        let config = Config::default();
         config.servers.insert(
             "survival".to_string(),
             BackendConfig {

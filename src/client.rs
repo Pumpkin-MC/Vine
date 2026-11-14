@@ -240,6 +240,20 @@ impl ClientHandler {
 
         let username = login_start.name.to_string();
 
+        if self.config.runtime.is_draining() {
+            info!(
+                "[{}] Refusing '{}': the proxy is draining",
+                self.peer_addr, username
+            );
+            Self::kick(
+                &mut encoder,
+                client_version,
+                "This proxy is restarting. Please reconnect.",
+            )
+            .await?;
+            return Ok(());
+        }
+
         let mut pre_login_event = PlayerPreLoginEvent {
             client_ip: client_ip.to_string(),
             username: username.clone(),

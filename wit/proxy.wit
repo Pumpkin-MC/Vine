@@ -1,5 +1,5 @@
 interface proxy {
-    use types.{player-info, server-info};
+    use types.{player-info, server-info, forwarding-mode};
 
     /// Returns the total number of connected players.
     get-player-count: func() -> u32;
@@ -27,6 +27,23 @@ interface proxy {
 
     /// Requests switching/connecting a player to a backend server.
     connect-player: func(player-uuid: string, server-name: string) -> bool;
+
+    /// Adds a backend server, or replaces the one with the same name. Players can
+    /// be sent to it at once. `secret` is required for velocity and vine
+    /// forwarding. Returns false if the name or address is empty or a required
+    /// secret is missing.
+    register-server: func(name: string, address: string, forwarding: forwarding-mode, secret: option<string>) -> bool;
+
+    /// Removes a backend server. Players on it stay connected; it can no longer
+    /// be picked for new connections or switches. Returns false if it wasn't registered.
+    unregister-server: func(name: string) -> bool;
+
+    /// Stops (true) or resumes (false) accepting new logins, so the proxy can be
+    /// emptied before it's stopped. Players already connected stay.
+    set-draining: func(draining: bool);
+
+    /// Whether the proxy is refusing new logins.
+    is-draining: func() -> bool;
 
     /// Sends a plugin message / custom payload to a player.
     send-plugin-message: func(player-uuid: string, channel: string, data: list<u8>) -> bool;

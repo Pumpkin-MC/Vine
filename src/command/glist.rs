@@ -84,7 +84,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_glist_empty() {
-        let mut config = Config::default();
+        let config = Config::default();
         config.servers.insert(
             "lobby".to_string(),
             BackendConfig {
@@ -125,7 +125,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_glist_with_players() {
-        let mut config = Config::default();
+        let config = Config::default();
         config.servers.insert(
             "lobby".to_string(),
             BackendConfig {
