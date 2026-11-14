@@ -1,10 +1,16 @@
 use serde::{Deserialize, Serialize};
 
-/// Configuration options for Bedrock Edition support.
+/// Bedrock Edition server-list replies.
+///
+/// Vine can't carry Bedrock players yet: this only answers RakNet unconnected
+/// pings, so the proxy shows up in a Bedrock client's server list. Clients from
+/// 26.60 on connect over NetherNet and don't send these pings, and older clients
+/// that see the entry can't join through it. Off by default so the proxy
+/// doesn't hold UDP 19132, which a Bedrock bridge such as Geyser usually needs.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BedrockConfig {
-    /// Whether Bedrock Edition listener and status response are enabled
+    /// Whether to answer Bedrock (RakNet) server-list pings. Off by default.
     pub enabled: bool,
     /// UDP address and port for the Bedrock listener (default Minecraft Bedrock port is 19132)
     pub bind_address: String,
@@ -31,7 +37,7 @@ pub struct BedrockConfig {
 impl Default for BedrockConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             bind_address: "0.0.0.0:19132".to_string(),
             motd: "§a§lVine §7» §fHigh-Performance Minecraft Proxy".to_string(),
             sub_motd: "Bedrock Support • 1.26.x".to_string(),
@@ -43,5 +49,17 @@ impl Default for BedrockConfig {
             max_players: 100,
             server_guid: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BedrockConfig;
+
+    #[test]
+    fn listener_is_off_by_default() {
+        assert!(!BedrockConfig::default().enabled);
+        let parsed: BedrockConfig = toml::from_str("").unwrap();
+        assert!(!parsed.enabled);
     }
 }

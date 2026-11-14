@@ -151,13 +151,13 @@ impl ProxyServer {
         }
         if self.config.bedrock.enabled {
             info!(
-                "  Bedrock Edition: enabled (listening on UDP {}, v{} / proto {})",
+                "  Bedrock server-list pings: answering on UDP {} (v{} / proto {})",
                 self.config.bedrock.bind_address,
                 self.config.bedrock.version_name,
                 self.config.bedrock.protocol_version
             );
         } else {
-            info!("  Bedrock Edition: disabled");
+            info!("  Bedrock server-list pings: off");
         }
         info!("=====================================================");
 
