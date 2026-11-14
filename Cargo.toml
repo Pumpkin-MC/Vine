@@ -12,6 +12,8 @@ pumpkin-command = { path = "../Pumpkin/crates/pumpkin-command" }
 pumpkin-plugin-runtime = { path = "../Pumpkin/crates/pumpkin-plugin-runtime" }
 wasmtime = { version = "50.0.1", default-features = false, features = ["runtime", "component-model", "component-model-async", "async", "cache", "cranelift", "gc", "gc-drc", "threads", "std"] }
 wasmtime-wasi = { version = "50.0.1", default-features = false, features = ["p2", "p3"] }
+wasmtime-wasi-http = { version = "50.0.1", default-features = false, features = ["p2", "default-send-request"] }
+hyper = { version = "1.12", default-features = false }
 
 tokio = { version = "1.53", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }

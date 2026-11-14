@@ -3,6 +3,9 @@ use std::sync::{Arc, Weak};
 
 use wasmtime::component::{Resource, ResourceTable};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
+
+use super::permissions::{Grants, HTTP_OUTBOUND, HttpHooks};
 
 use crate::command::CommandDispatcher;
 use crate::config::Config;
@@ -27,6 +30,8 @@ pub struct ContextResource {
 
 pub struct PluginHostState {
     pub wasi_ctx: WasiCtx,
+    pub wasi_http_ctx: WasiHttpCtx,
+    pub wasi_http_hooks: HttpHooks,
     pub resource_table: ResourceTable,
     pub limits: wasmtime::StoreLimits,
     pub proxy: Option<ProxyPluginContext>,
@@ -48,11 +53,20 @@ impl PluginHostState {
         data_folder: PathBuf,
         proxy: Option<ProxyPluginContext>,
     ) -> Self {
+        let grants = proxy
+            .as_ref()
+            .and_then(|proxy| proxy.config.plugins.permissions.get(&plugin_name))
+            .map(|granted| Grants::new(granted))
+            .unwrap_or_default();
+        let mut builder = WasiCtxBuilder::new();
+        builder.inherit_stdout().inherit_stderr();
+        grants.apply(&mut builder, &data_folder);
         Self {
-            wasi_ctx: WasiCtxBuilder::new()
-                .inherit_stdout()
-                .inherit_stderr()
-                .build(),
+            wasi_ctx: builder.build(),
+            wasi_http_ctx: WasiHttpCtx::new(),
+            wasi_http_hooks: HttpHooks {
+                allow_outbound: grants.has(HTTP_OUTBOUND),
+            },
             resource_table: ResourceTable::new(),
             limits: wasmtime::StoreLimitsBuilder::new().build(),
             proxy,
@@ -508,5 +522,15 @@ impl wit::vine::plugin::context::HostContext for PluginHostState {
             .resource_table
             .delete::<ContextResource>(Resource::new_own(rep.rep()));
         Ok(())
+    }
+}
+
+impl WasiHttpView for PluginHostState {
+    fn http(&mut self) -> WasiHttpCtxView<'_> {
+        WasiHttpCtxView {
+            ctx: &mut self.wasi_http_ctx,
+            table: &mut self.resource_table,
+            hooks: &mut self.wasi_http_hooks,
+        }
     }
 }

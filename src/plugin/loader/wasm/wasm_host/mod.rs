@@ -1,4 +1,5 @@
 pub mod concurrent_store;
+pub mod permissions;
 pub mod state;
 pub mod wit;
 
@@ -34,6 +35,7 @@ pub enum PluginInitError {
 pub fn setup_linker(engine: &Engine) -> wasmtime::Result<Linker<PluginHostState>> {
     let mut linker = Linker::<PluginHostState>::new(engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+    wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
     wit::Plugin::add_to_linker::<_, HasSelf<_>>(&mut linker, |state: &mut PluginHostState| state)?;
     Ok(linker)
 }

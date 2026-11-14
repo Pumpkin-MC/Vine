@@ -100,6 +100,11 @@ pub struct PluginConfig {
     pub enabled: bool,
     #[serde(default = "default_plugins_dir")]
     pub plugin_dir: String,
+    /// What each plugin may do outside its sandbox, keyed by plugin file name
+    /// (without `.wasm`), using Pumpkin's permission names, e.g.
+    /// `my-plugin = ["http.outbound"]`. Nothing is granted unless listed.
+    #[serde(default)]
+    pub permissions: HashMap<String, Vec<String>>,
 }
 
 fn default_plugins_dir() -> String {
@@ -111,6 +116,7 @@ impl Default for PluginConfig {
         Self {
             enabled: true,
             plugin_dir: default_plugins_dir(),
+            permissions: HashMap::new(),
         }
     }
 }
