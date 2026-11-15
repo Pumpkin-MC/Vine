@@ -1,29 +1,33 @@
-FROM alpine:3.24
+FROM ubuntu:26.04
 
 ARG TARGETARCH
 ARG VINE_TAG=nightly
 
-RUN apk add --no-cache curl ca-certificates && \
+RUN apt-get -o Acquire::Retries=3 update && \
+    DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y --no-install-recommends curl ca-certificates netcat-openbsd && \
     case "${TARGETARCH}" in \
         "amd64") BIN_ARCH="X64" ;; \
         "arm64") BIN_ARCH="ARM64" ;; \
         *) echo "Unsupported architecture: ${TARGETARCH}" && exit 1 ;; \
     esac && \
-    curl -fsSL "https://github.com/Pumpkin-MC/Vine/releases/download/${VINE_TAG}/vine-${BIN_ARCH}-Linux-musl" \
-        -o /usr/local/bin/vine && \
+    if [ "${VINE_TAG}" = "latest" ]; then \
+        DOWNLOAD_URL="https://github.com/Pumpkin-MC/Vine/releases/latest/download/vine-${BIN_ARCH}-Linux"; \
+    else \
+        DOWNLOAD_URL="https://github.com/Pumpkin-MC/Vine/releases/download/${VINE_TAG}/vine-${BIN_ARCH}-Linux"; \
+    fi && \
+    curl -fsSL --retry 3 "${DOWNLOAD_URL}" -o /usr/local/bin/vine && \
     chmod +x /usr/local/bin/vine && \
-    apk del curl
-
-RUN addgroup -g 2613 vine && \
-    adduser -u 2613 -G vine -D -h /vine vine && \
+    apt-get purge -y --auto-remove curl && \
+    rm -rf /var/lib/apt/lists/* && \
+    groupadd -g 2613 vine && \
+    useradd -u 2613 -g vine -m -d /vine vine && \
     chown -R vine:vine /vine
 
 WORKDIR /vine
 USER vine:vine
 
 ENV RUST_BACKTRACE=1
-EXPOSE 25565
-EXPOSE 19132/udp
+EXPOSE 25565 19132 19132/udp
 
 ENTRYPOINT [ "vine" ]
 

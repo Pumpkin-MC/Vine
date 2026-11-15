@@ -10,11 +10,10 @@
     "description": "Vine is a high-performance, lightweight, multi-version Minecraft proxy built entirely in Rust, offering sub-millisecond packet routing, WASM plugin support, and modern protocol compatibility.",
     "features": null,
     "docker_images": {
-        "Alpine": "ghcr.io/pterodactyl/yolks:alpine",
-        "Debian": "ghcr.io/pterodactyl/yolks:debian"
+        "Debian": "ghcr.io\/pelican-eggs\/yolks:debian"
     },
     "file_denylist": [],
-    "startup": "./vine",
+    "startup": ".\/vine",
     "config": {
         "files": "{\r\n    \"vine.toml\": {\r\n        \"parser\": \"file\",\r\n        \"find\": {\r\n            \"bind_address = \\\"0.0.0.0:25565\\\"\": \"bind_address = \\\"0.0.0.0:{{server.build.default.port}}\\\"\"\r\n        }\r\n    }\r\n}",
         "startup": "{\r\n    \"done\": \"Vine Minecraft Proxy is listening on\"\r\n}",
@@ -23,9 +22,9 @@
     },
     "scripts": {
         "installation": {
-            "script": "#!/bin/ash\r\nset -eux\r\n\r\napk add --no-cache curl jq\r\nmkdir -p /mnt/server\r\ncd /mnt/server\r\n\r\nARCH=$(uname -m)\r\ncase \"$ARCH\" in\r\n    x86_64|amd64)\r\n        VINE_ARCH=\"X64\"\r\n        ;;\r\n    aarch64|arm64)\r\n        VINE_ARCH=\"ARM64\"\r\n        ;;\r\n    *)\r\n        echo \"Unsupported architecture: $ARCH\"\r\n        exit 1\r\n        ;;\r\nesac\r\n\r\nBINARY_NAME=\"vine-${VINE_ARCH}-Linux-musl\"\r\n\r\nif [ -n \"${DOWNLOAD_URL:-}\" ]; then\r\n    URL=\"$DOWNLOAD_URL\"\r\nelif [ \"${VERSION:-nightly}\" = \"latest\" ] || [ \"${VERSION:-nightly}\" = \"nightly\" ]; then\r\n    URL=\"https://github.com/${GITHUB_PACKAGE:-Pumpkin-MC/Vine}/releases/download/nightly/${BINARY_NAME}\"\r\nelse\r\n    URL=\"https://github.com/${GITHUB_PACKAGE:-Pumpkin-MC/Vine}/releases/download/${VERSION}/${BINARY_NAME}\"\r\nfi\r\n\r\necho \"Downloading Vine from: $URL\"\r\ncurl -fsSL \"$URL\" -o /mnt/server/vine\r\nchmod +x /mnt/server/vine\r\n\r\n# Quickly start and kill proxy to generate initial configuration if not present\r\nif [ ! -f /mnt/server/vine.toml ]; then\r\n    timeout 2 ./vine || true\r\nfi",
-            "container": "ghcr.io/pterodactyl/installers:alpine",
-            "entrypoint": "ash"
+            "script": "#!\/bin\/bash\r\nset -eux\r\n\r\napt-get update\r\napt-get install -y --no-install-recommends curl ca-certificates\r\nmkdir -p \/mnt\/server\r\ncd \/mnt\/server\r\n\r\nARCH=$(uname -m)\r\ncase \"$ARCH\" in\r\n    x86_64|amd64)\r\n        VINE_ARCH=\"X64\"\r\n        ;;\r\n    aarch64|arm64)\r\n        VINE_ARCH=\"ARM64\"\r\n        ;;\r\n    *)\r\n        echo \"Unsupported architecture: $ARCH\"\r\n        exit 1\r\n        ;;\r\nesac\r\n\r\nBINARY_NAME=\"vine-${VINE_ARCH}-Linux\"\r\n\r\nif [ -n \"${DOWNLOAD_URL:-}\" ]; then\r\n    URL=\"$DOWNLOAD_URL\"\r\nelif [ \"${VERSION:-nightly}\" = \"latest\" ]; then\r\n    URL=\"https:\/\/github.com\/${GITHUB_PACKAGE:-Pumpkin-MC\/Vine}\/releases\/latest\/download\/${BINARY_NAME}\"\r\nelse\r\n    URL=\"https:\/\/github.com\/${GITHUB_PACKAGE:-Pumpkin-MC\/Vine}\/releases\/download\/${VERSION:-nightly}\/${BINARY_NAME}\"\r\nfi\r\n\r\necho \"Downloading Vine from: $URL\"\r\ncurl -fsSL \"$URL\" -o \/mnt\/server\/vine\r\nchmod +x \/mnt\/server\/vine\r\n\r\n# Generate initial configuration if not present\r\nif [ ! -f \/mnt\/server\/vine.toml ]; then\r\n    .\/vine --init-settings\r\nfi",
+            "container": "ghcr.io\/pelican-eggs\/installers:debian",
+            "entrypoint": "bash"
         }
     },
     "variables": [
