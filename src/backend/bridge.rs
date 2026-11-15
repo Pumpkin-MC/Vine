@@ -1111,43 +1111,56 @@ impl BackendBridge {
                             return TunnelExit::ClientDisconnected;
                         }
 
-                        if Some(raw_packet.id) == chat_command_id {
+                        // Before 1.19 there is no chat_command packet: a command is a chat
+                        // message starting with '/'.
+                        let command = if Some(raw_packet.id) == chat_command_id {
                             let mut payload = &raw_packet.payload[..];
-                            if let Ok(chat_cmd) = SChatCommand::read(&mut payload, &client_version)
-                            {
-                                let cmd_text = chat_cmd.command;
-                                let mut cmd_event = PlayerCommandEvent {
-                                    uuid: player_uuid.to_string(),
-                                    username: username.to_string(),
-                                    command: cmd_text.to_string(),
-                                    cancelled: false,
-                                };
-                                plugin_manager.fire_player_command(&mut cmd_event).await;
-                                if cmd_event.cancelled {
-                                    continue;
-                                }
+                            SChatCommand::read(&mut payload, &client_version)
+                                .ok()
+                                .map(|packet| packet.command)
+                        } else if client_version < JavaMinecraftVersion::V_1_19
+                            && Some(raw_packet.id) == chat_message_id
+                        {
+                            let mut payload = &raw_packet.payload[..];
+                            SChatMessage::read(&mut payload, &client_version)
+                                .ok()
+                                .and_then(|packet| packet.message.strip_prefix('/'))
+                        } else {
+                            None
+                        };
+                        let is_command = command.is_some();
+                        if let Some(cmd_text) = command {
+                            let mut cmd_event = PlayerCommandEvent {
+                                uuid: player_uuid.to_string(),
+                                username: username.to_string(),
+                                command: cmd_text.to_string(),
+                                cancelled: false,
+                            };
+                            plugin_manager.fire_player_command(&mut cmd_event).await;
+                            if cmd_event.cancelled {
+                                continue;
+                            }
 
-                                let first_word = cmd_event
-                                    .command
-                                    .split_whitespace()
-                                    .next()
-                                    .unwrap_or(&cmd_event.command);
-                                if command_dispatcher.has_command(first_word) {
-                                    let source = ProxyCommandSource {
-                                        sender: CommandSender::Player {
-                                            username: username.to_string(),
-                                            action_tx: action_tx.clone(),
-                                        },
-                                        config: proxy_config.clone(),
-                                        session_manager: session_manager.clone(),
-                                    };
-                                    command_dispatcher.handle_command(&source, &cmd_event.command);
-                                    continue;
-                                }
+                            let first_word = cmd_event
+                                .command
+                                .split_whitespace()
+                                .next()
+                                .unwrap_or(&cmd_event.command);
+                            if command_dispatcher.has_command(first_word) {
+                                let source = ProxyCommandSource {
+                                    sender: CommandSender::Player {
+                                        username: username.to_string(),
+                                        action_tx: action_tx.clone(),
+                                    },
+                                    config: proxy_config.clone(),
+                                    session_manager: session_manager.clone(),
+                                };
+                                command_dispatcher.handle_command(&source, &cmd_event.command);
+                                continue;
                             }
                         }
 
-                        if Some(raw_packet.id) == chat_message_id {
+                        if Some(raw_packet.id) == chat_message_id && !is_command {
                             let mut payload = &raw_packet.payload[..];
                             if let Ok(chat_msg) = SChatMessage::read(&mut payload, &client_version)
                             {
@@ -1607,6 +1620,45 @@ mod tests {
         assert!(
             to_backend.is_empty(),
             "the proxy command reached the backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_1_19_slash_chat_runs_proxy_commands() {
+        // 1.12.2 has no chat_command packet; "/help" arrives as chat (0x02) and the answer goes
+        // out as chat (0x0f).
+        let version = JavaMinecraftVersion::V_1_12_2;
+        let (exit, to_backend) = run_tunnel(version, |mut peers| async move {
+            peers
+                .send_from_client(packet_bytes(0x02, &string_payload("/help")))
+                .await;
+            assert_eq!(peers.next_to_client().await.id, 0x0f);
+            // Plain chat and other commands still go to the backend.
+            peers
+                .send_from_client(packet_bytes(0x02, &string_payload("hello")))
+                .await;
+            peers
+                .send_from_client(packet_bytes(0x02, &string_payload("/spawn")))
+                .await;
+            // Let the tunnel forward both before the backend hangs up.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            peers
+                .send_from_backend(packet_bytes(0x1a, &string_payload("\"bye\"")))
+                .await;
+            peers
+        })
+        .await;
+        assert!(matches!(exit, TunnelExit::BackendDisconnected { .. }));
+        let forwarded: Vec<_> = to_backend
+            .iter()
+            .map(|p| (p.id, p.payload.to_vec()))
+            .collect();
+        assert_eq!(
+            forwarded,
+            vec![
+                (0x02, string_payload("hello")),
+                (0x02, string_payload("/spawn")),
+            ]
         );
     }
 
