@@ -303,7 +303,7 @@ impl CommandExecutor<ProxyCommandSource> for VinePluginsExecutor {
             ));
         }
 
-        let plugins = self.runtime.loaded_plugins();
+        let plugins = self.runtime.loaded_plugin_details();
         if plugins.is_empty() {
             context.source.send_message(TextComponent::text(
                 "§6[Vine] §7No WASM plugins are currently loaded.",
@@ -312,7 +312,7 @@ impl CommandExecutor<ProxyCommandSource> for VinePluginsExecutor {
         }
 
         let mut lines = vec![format!("§6[Vine] §fLoaded plugins ({}):", plugins.len())];
-        for meta in &plugins {
+        for (meta, lang) in &plugins {
             let authors = if meta.authors.is_empty() {
                 String::new()
             } else {
@@ -324,7 +324,7 @@ impl CommandExecutor<ProxyCommandSource> for VinePluginsExecutor {
                 .filter(|d| !d.trim().is_empty())
                 .map_or_else(String::new, |d| format!(" §7- {d}"));
             lines.push(format!(
-                "  §a{} §fv{}{}{}",
+                "  §a{} §fv{} §e[{lang}]{}{}",
                 meta.name, meta.version, authors, desc
             ));
         }
@@ -333,6 +333,43 @@ impl CommandExecutor<ProxyCommandSource> for VinePluginsExecutor {
             .source
             .send_message(TextComponent::text(lines.join("\n")));
         Ok(plugins.len() as i32)
+    }
+}
+
+struct VinePluginsReloadExecutor {
+    runtime: Arc<CommandRuntime>,
+}
+
+impl CommandExecutor<ProxyCommandSource> for VinePluginsReloadExecutor {
+    fn execute(&self, context: &CommandContext<ProxyCommandSource>) -> CommandExecutorResult {
+        if !context.source.has_permission("vine.command.reload") {
+            return Err(command_error(
+                "You do not have permission to execute this command (required: vine.command.reload).",
+            ));
+        }
+
+        let Some(plugin_manager) = self.runtime.plugin_manager() else {
+            return Err(command_error(
+                "Plugin manager is not bound in this command context.",
+            ));
+        };
+
+        let sender = context.source.sender.clone();
+        tokio::spawn(async move {
+            match plugin_manager.reload_plugins().await {
+                Ok(count) => {
+                    sender.send_message(TextComponent::text(format!(
+                        "§6[Vine] §aReloaded WASM plugins successfully ({count} active)."
+                    )));
+                }
+                Err(err) => {
+                    sender.send_message(TextComponent::text(format!(
+                        "§6[Vine] §cFailed to reload WASM plugins: {err}"
+                    )));
+                }
+            }
+        });
+        Ok(1)
     }
 }
 
@@ -583,9 +620,19 @@ pub fn register(
             .then(literal("version").executes(VineInfoExecutor {
                 runtime: runtime.clone(),
             }))
-            .then(literal("plugins").executes(VinePluginsExecutor {
-                runtime: runtime.clone(),
-            }))
+            .then(
+                literal("plugins")
+                    .executes(VinePluginsExecutor {
+                        runtime: runtime.clone(),
+                    })
+                    .then(
+                        literal("reload")
+                            .requires(Requirement::from("vine.command.reload"))
+                            .executes(VinePluginsReloadExecutor {
+                                runtime: runtime.clone(),
+                            }),
+                    ),
+            )
             .then(literal("servers").executes(VineServersExecutor))
             .then(
                 literal("reload")

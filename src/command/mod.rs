@@ -170,6 +170,13 @@ impl CommandRuntime {
             .unwrap_or_default()
     }
 
+    #[must_use]
+    pub fn loaded_plugin_details(&self) -> Vec<(PluginMetadata, String)> {
+        self.plugin_manager()
+            .map(|pm| pm.list_plugins_with_language())
+            .unwrap_or_default()
+    }
+
     pub fn set_reload_handler(&self, handler: ReloadCallback) {
         if let Ok(mut guard) = self.reload_handler.write() {
             *guard = Some(handler);
@@ -503,6 +510,42 @@ impl Default for CommandDispatcher {
 }
 
 impl CommandDispatcher {
+    fn populate_builtins(
+        dispatcher: &mut RawCommandDispatcher<ProxyCommandSource>,
+        runtime: &Arc<CommandRuntime>,
+        weak_inner: SharedRawDispatcher,
+    ) {
+        server::register(dispatcher);
+        send::register(dispatcher);
+        glist::register(dispatcher);
+        alert::register(dispatcher);
+        find::register(dispatcher);
+        kick::register(dispatcher);
+        end::register(dispatcher, runtime.clone());
+        vine_cmd::register(dispatcher, runtime.clone());
+        dispatcher.register(
+            command("list", "Lists online players connected to the proxy")
+                .requires(Requirement::from("vine.command.list"))
+                .executes(ListCommandExecutor),
+        );
+        dispatcher.register(
+            command("help", "Displays list of available proxy commands")
+                .requires(Requirement::from("vine.command.help"))
+                .executes(HelpCommandExecutor {
+                    dispatcher: weak_inner.clone(),
+                })
+                .then(
+                    argument("command", StringArgumentType::SingleWord)
+                        .suggests(HelpSuggestionProvider {
+                            dispatcher: weak_inner.clone(),
+                        })
+                        .executes(CommandSpecificHelpExecutor {
+                            dispatcher: weak_inner,
+                        }),
+                ),
+        );
+    }
+
     /// Creates a new `CommandDispatcher` with all built-in proxy commands registered.
     pub fn new() -> Self {
         let runtime = Arc::new(CommandRuntime::new());
@@ -510,38 +553,20 @@ impl CommandDispatcher {
         let weak_inner = Arc::downgrade(&inner);
 
         if let Ok(mut dispatcher) = inner.write() {
-            server::register(&mut dispatcher);
-            send::register(&mut dispatcher);
-            glist::register(&mut dispatcher);
-            alert::register(&mut dispatcher);
-            find::register(&mut dispatcher);
-            kick::register(&mut dispatcher);
-            end::register(&mut dispatcher, runtime.clone());
-            vine_cmd::register(&mut dispatcher, runtime.clone());
-            dispatcher.register(
-                command("list", "Lists online players connected to the proxy")
-                    .requires(Requirement::from("vine.command.list"))
-                    .executes(ListCommandExecutor),
-            );
-            dispatcher.register(
-                command("help", "Displays list of available proxy commands")
-                    .requires(Requirement::from("vine.command.help"))
-                    .executes(HelpCommandExecutor {
-                        dispatcher: weak_inner.clone(),
-                    })
-                    .then(
-                        argument("command", StringArgumentType::SingleWord)
-                            .suggests(HelpSuggestionProvider {
-                                dispatcher: weak_inner.clone(),
-                            })
-                            .executes(CommandSpecificHelpExecutor {
-                                dispatcher: weak_inner,
-                            }),
-                    ),
-            );
+            Self::populate_builtins(&mut dispatcher, &runtime, weak_inner);
         }
 
         Self { inner, runtime }
+    }
+
+    /// Resets the dispatcher back to built-in proxy commands (clearing dynamically registered plugin commands).
+    pub fn reset_to_builtins(&self) {
+        let weak_inner = Arc::downgrade(&self.inner);
+        if let Ok(mut dispatcher) = self.inner.write() {
+            let mut fresh = RawCommandDispatcher::new();
+            Self::populate_builtins(&mut fresh, &self.runtime, weak_inner);
+            *dispatcher = fresh;
+        }
     }
 
     /// Returns a reference to the shared command runtime hooks.
