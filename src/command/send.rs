@@ -207,6 +207,9 @@ mod tests {
             action_tx: tx,
             client_ip: "127.0.0.1".to_string(),
             protocol_version: 765,
+            client_brand: None,
+            locale: None,
+            view_distance: None,
         });
 
         let source = ProxyCommandSource {
@@ -337,6 +340,9 @@ mod tests {
             action_tx: tx,
             client_ip: "127.0.0.1".to_string(),
             protocol_version: 765,
+            client_brand: None,
+            locale: None,
+            view_distance: None,
         });
 
         let source = ProxyCommandSource {

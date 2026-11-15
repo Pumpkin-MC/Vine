@@ -161,12 +161,6 @@ impl ProxyServer {
         }
         info!("=====================================================");
 
-        let telemetry_handle = telemetry::start_telemetry(
-            self.config.clone(),
-            self.online_players.clone(),
-            shutdown_rx.resubscribe(),
-        );
-
         if self.config.bedrock.enabled {
             let bedrock_cfg = self.config.bedrock.clone();
             let online_players = self.online_players.clone();
@@ -240,6 +234,14 @@ impl ProxyServer {
                 error!("Failed to load plugins: {}", e);
             }
         }
+
+        let telemetry_handle = telemetry::start_telemetry(
+            self.config.clone(),
+            self.online_players.clone(),
+            self.session_manager.clone(),
+            self.plugin_manager.clone(),
+            shutdown_rx.resubscribe(),
+        );
 
         loop {
             tokio::select! {

@@ -1,13 +1,85 @@
-use std::io::Cursor;
+use std::io::{Cursor, Error, Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use pumpkin_protocol::bedrock::status::{
-    CUnconnectedPong, OFFLINE_MESSAGE_MAGIC, SUnconnectedPing, SUnconnectedPingOpenConnections,
-};
 use pumpkin_protocol::serial::{PacketRead, PacketWrite};
 
 use crate::bedrock::config::BedrockConfig;
+
+/// Magic byte sequence present in offline `RakNet` message headers to verify protocol validity.
+pub const OFFLINE_MESSAGE_MAGIC: [u8; 16] = [
+    0x00, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe, 0xfd, 0xfd, 0xfd, 0xfd, 0x12, 0x34, 0x56, 0x78,
+];
+
+/// Unconnected ping sent by a Bedrock client over UDP to discover servers and query status.
+pub struct SUnconnectedPing {
+    pub time: u64,
+    pub magic: [u8; 16],
+    pub client_guid: u64,
+}
+
+impl PacketRead for SUnconnectedPing {
+    fn read<R: Read>(reader: &mut R) -> Result<Self, Error> {
+        let time = u64::read_be(reader)?;
+        let magic = <[u8; 16]>::read(reader)?;
+        let client_guid = u64::read_be(reader)?;
+        Ok(Self {
+            time,
+            magic,
+            client_guid,
+        })
+    }
+}
+
+/// Unconnected ping sent by a client requesting status only if open connection slots remain.
+pub struct SUnconnectedPingOpenConnections {
+    pub time: u64,
+    pub magic: [u8; 16],
+    pub client_guid: u64,
+}
+
+impl PacketRead for SUnconnectedPingOpenConnections {
+    fn read<R: Read>(reader: &mut R) -> Result<Self, Error> {
+        let ping = SUnconnectedPing::read(reader)?;
+        Ok(Self {
+            time: ping.time,
+            magic: ping.magic,
+            client_guid: ping.client_guid,
+        })
+    }
+}
+
+/// Unconnected pong sent by the server containing the Bedrock MOTD server advertisement string.
+pub struct CUnconnectedPong {
+    time: u64,
+    server_guid: u64,
+    magic: [u8; 16],
+    server_id: String,
+}
+
+impl CUnconnectedPong {
+    #[must_use]
+    pub const fn new(time: u64, server_guid: u64, server_id: String) -> Self {
+        Self {
+            time,
+            server_guid,
+            magic: OFFLINE_MESSAGE_MAGIC,
+            server_id,
+        }
+    }
+}
+
+impl PacketWrite for CUnconnectedPong {
+    fn write<W: Write>(&self, writer: &mut W) -> Result<(), Error> {
+        self.time.write_be(writer)?;
+        self.server_guid.write_be(writer)?;
+        writer.write_all(&self.magic)?;
+        let length = u16::try_from(self.server_id.len())
+            .map_err(|_| Error::other("Bedrock server advertisement is too long"))?;
+        writer.write_all(&length.to_be_bytes())?;
+        writer.write_all(self.server_id.as_bytes())
+    }
+}
 
 pub const RAKNET_UNCONNECTED_PING_ID: u8 = 0x01;
 pub const RAKNET_UNCONNECTED_PING_OPEN_ID: u8 = 0x02;

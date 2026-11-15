@@ -5,6 +5,8 @@ use uuid::Uuid;
 
 use pumpkin_util::text::TextComponent;
 
+use crate::telemetry::TelemetrySessionTracker;
+
 /// Actions that can be dispatched to an active player's connection
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlayerAction {
@@ -29,11 +31,15 @@ pub struct PlayerSession {
     pub action_tx: mpsc::UnboundedSender<PlayerAction>,
     pub client_ip: String,
     pub protocol_version: u32,
+    pub client_brand: Option<String>,
+    pub locale: Option<String>,
+    pub view_distance: Option<u8>,
 }
 
 /// Thread-safe registry of connected player sessions
 pub struct SessionManager {
     sessions: RwLock<HashMap<String, PlayerSession>>,
+    telemetry_sessions: TelemetrySessionTracker,
 }
 
 impl Default for SessionManager {
@@ -46,11 +52,19 @@ impl SessionManager {
     pub fn new() -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
+            telemetry_sessions: TelemetrySessionTracker::default(),
         }
+    }
+
+    /// Returns a reference to the telemetry session tracker.
+    #[must_use]
+    pub const fn telemetry_sessions(&self) -> &TelemetrySessionTracker {
+        &self.telemetry_sessions
     }
 
     /// Registers a new active player session
     pub fn register(&self, session: PlayerSession) {
+        self.telemetry_sessions.record_join(session.uuid);
         if let Ok(mut lock) = self.sessions.write() {
             lock.insert(session.username.to_ascii_lowercase(), session);
         }
@@ -58,11 +72,15 @@ impl SessionManager {
 
     /// Unregisters an active session by username
     pub fn unregister(&self, username: &str) -> Option<PlayerSession> {
-        if let Ok(mut lock) = self.sessions.write() {
+        let removed = if let Ok(mut lock) = self.sessions.write() {
             lock.remove(&username.to_ascii_lowercase())
         } else {
             None
+        };
+        if let Some(ref session) = removed {
+            self.telemetry_sessions.record_leave(session);
         }
+        removed
     }
 
     /// Updates the current server for an active session
@@ -71,6 +89,25 @@ impl SessionManager {
             && let Some(session) = lock.get_mut(&username.to_ascii_lowercase())
         {
             session.current_server = new_server.to_string();
+        }
+    }
+
+    /// Updates the client brand (`minecraft:brand`) for an active session
+    pub fn update_client_brand(&self, username: &str, brand: String) {
+        if let Ok(mut lock) = self.sessions.write()
+            && let Some(session) = lock.get_mut(&username.to_ascii_lowercase())
+        {
+            session.client_brand = Some(brand);
+        }
+    }
+
+    /// Updates client locale and view distance for an active session
+    pub fn update_client_settings(&self, username: &str, locale: String, view_distance: u8) {
+        if let Ok(mut lock) = self.sessions.write()
+            && let Some(session) = lock.get_mut(&username.to_ascii_lowercase())
+        {
+            session.locale = Some(locale);
+            session.view_distance = Some(view_distance);
         }
     }
 
@@ -119,6 +156,9 @@ mod tests {
             action_tx: tx,
             client_ip: "127.0.0.1:12345".to_string(),
             protocol_version: 765,
+            client_brand: None,
+            locale: None,
+            view_distance: None,
         };
 
         manager.register(session);
@@ -145,6 +185,9 @@ mod tests {
             action_tx: tx,
             client_ip: "127.0.0.1:12346".to_string(),
             protocol_version: 765,
+            client_brand: None,
+            locale: None,
+            view_distance: None,
         };
         manager.register(session);
         assert_eq!(manager.get_session("Alex").unwrap().current_server, "lobby");

@@ -160,6 +160,9 @@ mod tests {
             action_tx: tx1,
             client_ip: "127.0.0.1".to_string(),
             protocol_version: 765,
+            client_brand: None,
+            locale: None,
+            view_distance: None,
         });
         session_manager.register(PlayerSession {
             username: "Alex".to_string(),
@@ -168,6 +171,9 @@ mod tests {
             action_tx: tx2,
             client_ip: "127.0.0.1".to_string(),
             protocol_version: 765,
+            client_brand: None,
+            locale: None,
+            view_distance: None,
         });
 
         let (action_tx, mut action_rx) = mpsc::unbounded_channel();

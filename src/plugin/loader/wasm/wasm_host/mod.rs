@@ -10,7 +10,7 @@ use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::{Engine, Store};
 
 use crate::plugin::api::{Plugin, PluginContext, PluginFuture, PluginMetadata};
-use concurrent_store::{LegacyStore, LegacySyncReentry, TokioSpawner};
+use concurrent_store::{LegacyStore, LegacySyncReentry, StoreMode, TokioSpawner};
 use state::{PluginHostState, ProxyPluginContext};
 
 #[derive(Error, Debug)]
@@ -65,7 +65,7 @@ impl WasmPlugin {
         let func = self.instance.func_on_unload();
         let context_clone = context.clone();
         self.store
-            .call_guest(move |mut guest| {
+            .shutdown(move |mut guest| {
                 Box::pin(async move {
                     let context_res =
                         guest.with(|mut store| store.data_mut().add_context(context_clone))?;
@@ -238,6 +238,7 @@ impl PluginRuntime {
             store,
             self.reentry.clone(),
             Arc::clone(&self.spawner) as Arc<dyn pumpkin_plugin_runtime::RuntimeSpawner>,
+            StoreMode::Concurrent,
         )
         .await
         .map_err(PluginInitError::InstantiationFailed)?;
@@ -251,13 +252,8 @@ impl PluginRuntime {
         let weak = Arc::downgrade(&wasm_plugin);
         wasm_plugin
             .store
-            .call(move |accessor| {
-                Box::pin(async move {
-                    accessor.with(|mut store| {
-                        store.data_mut().plugin = Some(weak);
-                    });
-                    Ok(())
-                })
+            .call(move |state| {
+                state.plugin = Some(weak);
             })
             .await
             .map_err(PluginInitError::InstantiationFailed)?;

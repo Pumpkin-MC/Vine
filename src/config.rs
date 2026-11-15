@@ -267,7 +267,7 @@ fn default_telemetry_interval() -> u64 {
 }
 
 fn default_telemetry_endpoint() -> String {
-    "https://market.pumpkinmc.org/api/v1/rest/telemetry/heartbeat".to_string()
+    "https://telemetry.pumpkinmc.org/v1/heartbeat".to_string()
 }
 
 /// Telemetry configuration options.
@@ -417,7 +417,7 @@ mod tests {
         assert!(default_config.enabled);
         assert_eq!(
             default_config.endpoint,
-            "https://market.pumpkinmc.org/api/v1/rest/telemetry/heartbeat"
+            "https://telemetry.pumpkinmc.org/v1/heartbeat"
         );
         assert_eq!(default_config.interval_secs, 300);
         assert!(!default_config.public);
@@ -428,7 +428,7 @@ mod tests {
     fn test_telemetry_toml_deserialization() {
         let toml_str = r#"
             enabled = false
-            endpoint = "http://localhost:5000/api/v1/rest/telemetry/heartbeat"
+            endpoint = "http://localhost:5000/v1/heartbeat"
             interval_secs = 120
             public = true
             server_name = "Vine Proxy Hub"
@@ -436,10 +436,7 @@ mod tests {
 
         let config: TelemetryConfig = toml::from_str(toml_str).unwrap();
         assert!(!config.enabled);
-        assert_eq!(
-            config.endpoint,
-            "http://localhost:5000/api/v1/rest/telemetry/heartbeat"
-        );
+        assert_eq!(config.endpoint, "http://localhost:5000/v1/heartbeat");
         assert_eq!(config.interval_secs, 120);
         assert!(config.public);
         assert_eq!(config.server_name.as_deref(), Some("Vine Proxy Hub"));

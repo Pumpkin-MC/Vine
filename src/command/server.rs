@@ -184,6 +184,9 @@ mod tests {
             action_tx: action_tx.clone(),
             client_ip: "127.0.0.1".to_string(),
             protocol_version: 765,
+            client_brand: None,
+            locale: None,
+            view_distance: None,
         };
         session_manager.register(session);
 

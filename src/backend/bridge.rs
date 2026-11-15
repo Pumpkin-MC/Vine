@@ -15,10 +15,16 @@ use pumpkin_protocol::java::client::play::{
 };
 use pumpkin_protocol::java::packet_decoder::TCPNetworkDecoder;
 use pumpkin_protocol::java::packet_encoder::TCPNetworkEncoder;
+use pumpkin_protocol::java::server::config::{
+    SAcknowledgeFinishConfig, SClientInformationConfig, SPluginMessage,
+};
 use pumpkin_protocol::java::server::handshake::SHandShake;
-use pumpkin_protocol::java::server::login::{SLoginPluginResponse, SLoginStart};
+use pumpkin_protocol::java::server::login::{
+    SLoginAcknowledged, SLoginPluginResponse, SLoginStart,
+};
 use pumpkin_protocol::java::server::play::{
-    SChatCommand, SChatMessage, SCommandSuggestion, SCustomPayload,
+    SChatCommand, SChatMessage, SClientInformationPlay, SCommandSuggestion,
+    SConfigurationAcknowledged, SCustomPayload,
 };
 use pumpkin_protocol::packet::MultiVersionJavaPacket;
 use pumpkin_protocol::ser::{NetworkReadExt, NetworkReadSliceExt};
@@ -520,7 +526,16 @@ impl BackendBridge {
             action_tx: action_tx.clone(),
             client_ip: self.client_ip.to_string(),
             protocol_version: self.client_version.protocol_version() as u32,
+            client_brand: None,
+            locale: None,
+            view_distance: None,
         });
+
+        let mut client_state = if self.client_version >= JavaMinecraftVersion::V_1_20_2 {
+            ConnectionState::Login
+        } else {
+            ConnectionState::Play
+        };
 
         loop {
             let tunnel_res = Self::bridge_tunnel(
@@ -531,6 +546,7 @@ impl BackendBridge {
                 &mut backend_encoder,
                 self.max_packets_per_sec,
                 self.client_version,
+                &mut client_state,
                 &mut action_rx,
                 &action_tx,
                 self.command_dispatcher.clone(),
@@ -1017,6 +1033,7 @@ impl BackendBridge {
         backend_encoder: &mut TCPNetworkEncoder<W2>,
         max_packets_per_sec: u32,
         client_version: JavaMinecraftVersion,
+        client_state: &mut ConnectionState,
         action_rx: &mut tokio::sync::mpsc::UnboundedReceiver<PlayerAction>,
         action_tx: &tokio::sync::mpsc::UnboundedSender<PlayerAction>,
         command_dispatcher: Arc<CommandDispatcher>,
@@ -1033,6 +1050,12 @@ impl BackendBridge {
         W2: AsyncWrite + Unpin,
     {
         let mut client_rate_limiter = PacketRateLimiter::new(max_packets_per_sec);
+        let login_ack_id = SLoginAcknowledged::to_id(client_version);
+        let config_client_info_id = SClientInformationConfig::to_id(client_version);
+        let config_plugin_msg_id = SPluginMessage::to_id(client_version);
+        let config_finish_ack_id = SAcknowledgeFinishConfig::to_id(client_version);
+        let play_config_ack_id = SConfigurationAcknowledged::to_id(client_version);
+        let play_client_info_id = SClientInformationPlay::to_id(client_version);
         let chat_command_id = SChatCommand::to_id(client_version);
         let chat_message_id = SChatMessage::to_id(client_version);
         let custom_payload_id = SCustomPayload::to_id(client_version);
@@ -1073,176 +1096,284 @@ impl BackendBridge {
                             return TunnelExit::ClientDisconnected;
                         }
 
-                        if raw_packet.id == chat_command_id {
-                            let mut payload = &raw_packet.payload[..];
-                            if let Ok(chat_cmd) = SChatCommand::read(&mut payload, &client_version)
-                            {
-                                let cmd_text = chat_cmd.command;
-                                let mut cmd_event = PlayerCommandEvent {
-                                    uuid: player_uuid.to_string(),
-                                    username: username.to_string(),
-                                    command: cmd_text.to_string(),
-                                    cancelled: false,
-                                };
-                                plugin_manager.fire_player_command(&mut cmd_event).await;
-                                if cmd_event.cancelled {
-                                    continue;
-                                }
-
-                                let first_word = cmd_event
-                                    .command
-                                    .split_whitespace()
-                                    .next()
-                                    .unwrap_or(&cmd_event.command);
-                                if command_dispatcher.has_command(first_word) {
-                                    let source = ProxyCommandSource {
-                                        sender: CommandSender::Player {
-                                            username: username.to_string(),
-                                            action_tx: action_tx.clone(),
-                                        },
-                                        config: proxy_config.clone(),
-                                        session_manager: session_manager.clone(),
-                                    };
-                                    command_dispatcher.handle_command(&source, &cmd_event.command);
-                                    continue;
-                                }
-                            }
-                        }
-
-                        if raw_packet.id == chat_message_id {
-                            let mut payload = &raw_packet.payload[..];
-                            if let Ok(chat_msg) = SChatMessage::read(&mut payload, &client_version)
-                            {
-                                let mut chat_event = PlayerChatEvent {
-                                    uuid: player_uuid.to_string(),
-                                    username: username.to_string(),
-                                    message: chat_msg.message.to_string(),
-                                    cancelled: false,
-                                };
-                                plugin_manager.fire_player_chat(&mut chat_event).await;
-                                if chat_event.cancelled {
-                                    continue;
-                                }
-                            }
-                        }
-
-                        if raw_packet.id == custom_payload_id {
-                            let mut payload = &raw_packet.payload[..];
-                            if let Ok(custom_payload) =
-                                SCustomPayload::read(&mut payload, &client_version)
-                            {
-                                let mut msg_event = PluginMessageEvent {
-                                    channel: custom_payload.channel.to_string(),
-                                    data: custom_payload.data.to_vec(),
-                                    player_uuid: Some(player_uuid.to_string()),
-                                    server_name: Some(current_server_name.clone()),
-                                    cancelled: false,
-                                };
-                                plugin_manager.fire_plugin_message(&mut msg_event).await;
-                                if msg_event.cancelled {
-                                    continue;
-                                }
-                            }
-                        }
-
-                        if raw_packet.id == command_suggestion_id {
-                            let mut payload = &raw_packet.payload[..];
-                            if let Ok(suggestion_req) =
-                                SCommandSuggestion::read(&mut payload, &client_version)
-                            {
-                                let raw_cmd = &suggestion_req.command;
-                                let clean_cmd = raw_cmd.strip_prefix('/').unwrap_or(raw_cmd);
-                                let first_word =
-                                    clean_cmd.split_whitespace().next().unwrap_or(clean_cmd);
-                                let source = ProxyCommandSource {
-                                    sender: CommandSender::Player {
-                                        username: username.to_string(),
-                                        action_tx: action_tx.clone(),
-                                    },
-                                    config: proxy_config.clone(),
-                                    session_manager: session_manager.clone(),
-                                };
-
-                                // 1. Arguments to a proxy command (contains a space, e.g. "/server ", "/send ")
-                                if clean_cmd.contains(' ')
-                                    && command_dispatcher.has_command(first_word)
+                        match *client_state {
+                            ConnectionState::Login => {
+                                if client_version >= JavaMinecraftVersion::V_1_20_2
+                                    && raw_packet.id == login_ack_id
                                 {
-                                    let suggestions =
-                                        command_dispatcher.suggest_with_range(clean_cmd, &source);
-                                    let offset = if raw_cmd.starts_with('/') { 1 } else { 0 };
-                                    let matches: Box<[pumpkin_protocol::java::client::play::CommandSuggestion]> = suggestions
-                                        .suggestions
-                                        .into_iter()
-                                        .map(|s| pumpkin_protocol::java::client::play::CommandSuggestion {
-                                            suggestion: s.text.cached_text().clone(),
-                                            tooltip: s.tooltip,
-                                        })
-                                        .collect();
-                                    let resp = CCommandSuggestions::new(
-                                        suggestion_req.id,
-                                        VarInt((suggestions.range.start + offset) as i32),
-                                        VarInt(suggestions.range.len() as i32),
-                                        matches,
-                                    );
-                                    if let Ok(bytes) = resp.serialize_packet(&client_version) {
-                                        let _ = client_tx.send(bytes);
-                                    }
-                                    continue;
+                                    *client_state = ConnectionState::Config;
                                 }
-
-                                // 2. Root command name completion (no space, e.g. "/", "/s", "/ser", "/server")
-                                if !clean_cmd.contains(' ') {
-                                    let clean_lower = clean_cmd.to_ascii_lowercase();
-                                    let permitted =
-                                        command_dispatcher.get_all_permitted_commands(&source);
-                                    let proxy_matches: Vec<(String, Option<String>)> = permitted
-                                        .into_iter()
-                                        .filter(|(cmd_name, _)| cmd_name.starts_with(&clean_lower))
-                                        .map(|(cmd_name, description)| {
-                                            (cmd_name.to_string(), Some(description.to_string()))
-                                        })
-                                        .collect();
-
-                                    if !proxy_matches.is_empty() {
-                                        let offset = if raw_cmd.starts_with('/') { 1 } else { 0 };
-                                        let req_id = suggestion_req.id.0;
-
-                                        pending_suggestions.lock().await.insert(
-                                            req_id,
-                                            PendingSuggestion {
-                                                clean_cmd: clean_cmd.to_string(),
-                                                offset,
-                                                proxy_matches,
-                                            },
+                            }
+                            ConnectionState::Config => {
+                                if raw_packet.id == config_client_info_id {
+                                    let mut payload = &raw_packet.payload[..];
+                                    if let Ok(info) = SClientInformationConfig::read(
+                                        &mut payload,
+                                        &client_version,
+                                    ) {
+                                        session_manager.update_client_settings(
+                                            username,
+                                            info.locale.to_string(),
+                                            info.view_distance.max(0) as u8,
                                         );
+                                    }
+                                } else if raw_packet.id == config_plugin_msg_id {
+                                    let mut payload = &raw_packet.payload[..];
+                                    if let Ok(plugin_msg) =
+                                        SPluginMessage::read(&mut payload, &client_version)
+                                        && (plugin_msg.channel == "minecraft:brand"
+                                            || plugin_msg.channel == "MC|Brand")
+                                    {
+                                        let mut brand_slice = plugin_msg.data;
+                                        if let Ok(brand) = brand_slice.get_str_bounded_borrowed(256)
+                                        {
+                                            session_manager
+                                                .update_client_brand(username, brand.to_string());
+                                        }
+                                    }
+                                } else if raw_packet.id == config_finish_ack_id {
+                                    *client_state = ConnectionState::Play;
+                                }
+                            }
+                            _ => {
+                                if client_version >= JavaMinecraftVersion::V_1_20_2
+                                    && raw_packet.id == play_config_ack_id
+                                {
+                                    *client_state = ConnectionState::Config;
+                                } else {
+                                    if raw_packet.id == play_client_info_id {
+                                        let mut payload = &raw_packet.payload[..];
+                                        if let Ok(info) = SClientInformationPlay::read(
+                                            &mut payload,
+                                            &client_version,
+                                        ) {
+                                            session_manager.update_client_settings(
+                                                username,
+                                                info.locale.to_string(),
+                                                info.view_distance.max(0) as u8,
+                                            );
+                                        }
+                                    }
 
-                                        let pending_ref = pending_suggestions.clone();
-                                        let client_tx_clone = client_tx.clone();
-                                        let cv = client_version;
-                                        tokio::spawn(async move {
-                                            tokio::time::sleep(Duration::from_millis(200)).await;
-                                            if let Some(pending) =
-                                                pending_ref.lock().await.remove(&req_id)
+                                    if raw_packet.id == chat_command_id {
+                                        let mut payload = &raw_packet.payload[..];
+                                        if let Ok(chat_cmd) =
+                                            SChatCommand::read(&mut payload, &client_version)
+                                        {
+                                            let cmd_text = chat_cmd.command;
+                                            let mut cmd_event = PlayerCommandEvent {
+                                                uuid: player_uuid.to_string(),
+                                                username: username.to_string(),
+                                                command: cmd_text.to_string(),
+                                                cancelled: false,
+                                            };
+                                            plugin_manager
+                                                .fire_player_command(&mut cmd_event)
+                                                .await;
+                                            if cmd_event.cancelled {
+                                                continue;
+                                            }
+
+                                            let first_word = cmd_event
+                                                .command
+                                                .split_whitespace()
+                                                .next()
+                                                .unwrap_or(&cmd_event.command);
+                                            if command_dispatcher.has_command(first_word) {
+                                                let source = ProxyCommandSource {
+                                                    sender: CommandSender::Player {
+                                                        username: username.to_string(),
+                                                        action_tx: action_tx.clone(),
+                                                    },
+                                                    config: proxy_config.clone(),
+                                                    session_manager: session_manager.clone(),
+                                                };
+                                                command_dispatcher
+                                                    .handle_command(&source, &cmd_event.command);
+                                                continue;
+                                            }
+                                        }
+                                    }
+
+                                    if raw_packet.id == chat_message_id {
+                                        let mut payload = &raw_packet.payload[..];
+                                        if let Ok(chat_msg) =
+                                            SChatMessage::read(&mut payload, &client_version)
+                                        {
+                                            let mut chat_event = PlayerChatEvent {
+                                                uuid: player_uuid.to_string(),
+                                                username: username.to_string(),
+                                                message: chat_msg.message.to_string(),
+                                                cancelled: false,
+                                            };
+                                            plugin_manager.fire_player_chat(&mut chat_event).await;
+                                            if chat_event.cancelled {
+                                                continue;
+                                            }
+                                        }
+                                    }
+
+                                    if raw_packet.id == custom_payload_id {
+                                        let mut payload = &raw_packet.payload[..];
+                                        if let Ok(custom_payload) =
+                                            SCustomPayload::read(&mut payload, &client_version)
+                                        {
+                                            if custom_payload.channel == "minecraft:brand"
+                                                || custom_payload.channel == "MC|Brand"
                                             {
-                                                let suggestions: Vec<pumpkin_protocol::java::client::play::CommandSuggestion> = pending
-                                                    .proxy_matches
+                                                let mut brand_slice = custom_payload.data;
+                                                if let Ok(brand) =
+                                                    brand_slice.get_str_bounded_borrowed(256)
+                                                {
+                                                    session_manager.update_client_brand(
+                                                        username,
+                                                        brand.to_string(),
+                                                    );
+                                                }
+                                            }
+
+                                            let mut msg_event = PluginMessageEvent {
+                                                channel: custom_payload.channel.to_string(),
+                                                data: custom_payload.data.to_vec(),
+                                                player_uuid: Some(player_uuid.to_string()),
+                                                server_name: Some(current_server_name.clone()),
+                                                cancelled: false,
+                                            };
+                                            plugin_manager
+                                                .fire_plugin_message(&mut msg_event)
+                                                .await;
+                                            if msg_event.cancelled {
+                                                continue;
+                                            }
+                                        }
+                                    }
+
+                                    if raw_packet.id == command_suggestion_id {
+                                        let mut payload = &raw_packet.payload[..];
+                                        if let Ok(suggestion_req) =
+                                            SCommandSuggestion::read(&mut payload, &client_version)
+                                        {
+                                            let raw_cmd = &suggestion_req.command;
+                                            let clean_cmd =
+                                                raw_cmd.strip_prefix('/').unwrap_or(raw_cmd);
+                                            let first_word = clean_cmd
+                                                .split_whitespace()
+                                                .next()
+                                                .unwrap_or(clean_cmd);
+                                            let source = ProxyCommandSource {
+                                                sender: CommandSender::Player {
+                                                    username: username.to_string(),
+                                                    action_tx: action_tx.clone(),
+                                                },
+                                                config: proxy_config.clone(),
+                                                session_manager: session_manager.clone(),
+                                            };
+
+                                            // 1. Arguments to a proxy command (contains a space, e.g. "/server ", "/send ")
+                                            if clean_cmd.contains(' ')
+                                                && command_dispatcher.has_command(first_word)
+                                            {
+                                                let suggestions = command_dispatcher
+                                                    .suggest_with_range(clean_cmd, &source);
+                                                let offset =
+                                                    if raw_cmd.starts_with('/') { 1 } else { 0 };
+                                                let matches: Box<[pumpkin_protocol::java::client::play::CommandSuggestion]> = suggestions
+                                                    .suggestions
                                                     .into_iter()
-                                                    .map(|(cmd, tip)| pumpkin_protocol::java::client::play::CommandSuggestion {
-                                                        suggestion: cmd,
-                                                        tooltip: tip.map(TextComponent::text),
+                                                    .map(|s| pumpkin_protocol::java::client::play::CommandSuggestion {
+                                                        suggestion: s.text.cached_text().clone(),
+                                                        tooltip: s.tooltip,
                                                     })
                                                     .collect();
                                                 let resp = CCommandSuggestions::new(
-                                                    VarInt(req_id),
-                                                    VarInt(pending.offset as i32),
-                                                    VarInt(pending.clean_cmd.len() as i32),
-                                                    suggestions.into_boxed_slice(),
+                                                    suggestion_req.id,
+                                                    VarInt(
+                                                        (suggestions.range.start + offset) as i32,
+                                                    ),
+                                                    VarInt(suggestions.range.len() as i32),
+                                                    matches,
                                                 );
-                                                if let Ok(bytes) = resp.serialize_packet(&cv) {
-                                                    let _ = client_tx_clone.send(bytes);
+                                                if let Ok(bytes) =
+                                                    resp.serialize_packet(&client_version)
+                                                {
+                                                    let _ = client_tx.send(bytes);
+                                                }
+                                                continue;
+                                            }
+
+                                            // 2. Root command name completion (no space, e.g. "/", "/s", "/ser", "/server")
+                                            if !clean_cmd.contains(' ') {
+                                                let clean_lower = clean_cmd.to_ascii_lowercase();
+                                                let permitted = command_dispatcher
+                                                    .get_all_permitted_commands(&source);
+                                                let proxy_matches: Vec<(String, Option<String>)> =
+                                                    permitted
+                                                        .into_iter()
+                                                        .filter(|(cmd_name, _)| {
+                                                            cmd_name.starts_with(&clean_lower)
+                                                        })
+                                                        .map(|(cmd_name, description)| {
+                                                            (
+                                                                cmd_name.to_string(),
+                                                                Some(description.to_string()),
+                                                            )
+                                                        })
+                                                        .collect();
+
+                                                if !proxy_matches.is_empty() {
+                                                    let offset = if raw_cmd.starts_with('/') {
+                                                        1
+                                                    } else {
+                                                        0
+                                                    };
+                                                    let req_id = suggestion_req.id.0;
+
+                                                    pending_suggestions.lock().await.insert(
+                                                        req_id,
+                                                        PendingSuggestion {
+                                                            clean_cmd: clean_cmd.to_string(),
+                                                            offset,
+                                                            proxy_matches,
+                                                        },
+                                                    );
+
+                                                    let pending_ref = pending_suggestions.clone();
+                                                    let client_tx_clone = client_tx.clone();
+                                                    let cv = client_version;
+                                                    tokio::spawn(async move {
+                                                        tokio::time::sleep(Duration::from_millis(
+                                                            200,
+                                                        ))
+                                                        .await;
+                                                        if let Some(pending) =
+                                                            pending_ref.lock().await.remove(&req_id)
+                                                        {
+                                                            let suggestions: Vec<pumpkin_protocol::java::client::play::CommandSuggestion> = pending
+                                                                .proxy_matches
+                                                                .into_iter()
+                                                                .map(|(cmd, tip)| pumpkin_protocol::java::client::play::CommandSuggestion {
+                                                                    suggestion: cmd,
+                                                                    tooltip: tip.map(TextComponent::text),
+                                                                })
+                                                                .collect();
+                                                            let resp = CCommandSuggestions::new(
+                                                                VarInt(req_id),
+                                                                VarInt(pending.offset as i32),
+                                                                VarInt(
+                                                                    pending.clean_cmd.len() as i32
+                                                                ),
+                                                                suggestions.into_boxed_slice(),
+                                                            );
+                                                            if let Ok(bytes) =
+                                                                resp.serialize_packet(&cv)
+                                                            {
+                                                                let _ = client_tx_clone.send(bytes);
+                                                            }
+                                                        }
+                                                    });
                                                 }
                                             }
-                                        });
+                                        }
                                     }
                                 }
                             }

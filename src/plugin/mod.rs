@@ -204,6 +204,19 @@ impl PluginManager {
         self.event_handlers.write().await.clear();
     }
 
+    /// Returns telemetry metadata for all currently loaded plugins.
+    pub async fn active_plugins_telemetry(&self) -> Vec<crate::telemetry::PluginInfo> {
+        let plugins = self.loaded_plugins.read().await;
+        plugins
+            .iter()
+            .map(|p| crate::telemetry::PluginInfo {
+                name: p.metadata.name.clone(),
+                version: p.metadata.version.clone(),
+                language: Some("wasm".to_string()),
+            })
+            .collect()
+    }
+
     // --- Event dispatchers ---
 
     pub async fn fire_proxy_ping(&self, event: &mut ProxyPingEvent) {
