@@ -5,5 +5,9 @@ interface metadata {
         authors: list<string>,
         description: option<string>,
         dependencies: list<string>,
+        permissions: list<string>,
     }
+
+    /// Provides plugin metadata to the proxy host.
+    get-metadata: func() -> plugin-metadata;
 }

@@ -1,6 +1,9 @@
 interface proxy {
     use types.{player-info, server-info};
 
+    /// Returns the Vine proxy version string.
+    get-proxy-version: func() -> string;
+
     /// Returns the total number of connected players.
     get-player-count: func() -> u32;
 
@@ -25,9 +28,15 @@ interface proxy {
     /// Disconnects/kicks a player by UUID with the given reason.
     disconnect-player: func(player-uuid: string, reason: string) -> bool;
 
-    /// Requests switching/connecting a player to a backend server.
+    /// Requests switching/connecting a player to a configured backend server.
     connect-player: func(player-uuid: string, server-name: string) -> bool;
+
+    /// Transfers a player to an external server host and port (1.20.5+ Transfer packet).
+    transfer-player: func(player-uuid: string, host: string, port: u16) -> bool;
 
     /// Sends a plugin message / custom payload to a player.
     send-plugin-message: func(player-uuid: string, channel: string, data: list<u8>) -> bool;
+
+    /// Executes a proxy command as the console sender.
+    execute-command: func(command: string) -> bool;
 }

@@ -1,0 +1,10 @@
+interface scheduler {
+    /// Schedules a one-shot task to run after `delay-ms` milliseconds. Returns its unique task ID.
+    schedule-delayed: func(handler-id: u32, delay-ms: u64) -> u32;
+
+    /// Schedules a repeating task to run after `delay-ms` milliseconds and every `period-ms` milliseconds thereafter.
+    schedule-repeating: func(handler-id: u32, delay-ms: u64, period-ms: u64) -> u32;
+
+    /// Cancels a previously scheduled task. Returns `true` if the task was active.
+    cancel-task: func(task-id: u32) -> bool;
+}

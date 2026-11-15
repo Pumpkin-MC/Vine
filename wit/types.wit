@@ -5,6 +5,9 @@ interface types {
         current-server: string,
         client-ip: string,
         protocol-version: u32,
+        client-brand: option<string>,
+        locale: option<string>,
+        view-distance: option<u8>,
     }
 
     record server-info {

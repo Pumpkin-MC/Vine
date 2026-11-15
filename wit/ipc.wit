@@ -1,0 +1,4 @@
+interface ipc {
+    /// Sends an IPC payload to another active plugin by name and returns its response.
+    send-ipc-message: func(target-plugin: string, message: list<u8>) -> result<list<u8>, string>;
+}
