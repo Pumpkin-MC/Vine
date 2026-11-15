@@ -5,6 +5,7 @@ edition = "2024"
 license = "GPL-3.0"
 
 [dependencies]
+pumpkin-data = { path = "../Pumpkin/crates/pumpkin-data" }
 pumpkin-protocol = { path = "../Pumpkin/crates/pumpkin-protocol" }
 pumpkin-util = { path = "../Pumpkin/crates/pumpkin-util" }
 pumpkin-auth = { path = "../Pumpkin/crates/pumpkin-auth" }

@@ -2993,6 +2993,7 @@ dependencies = [
  "num-bigint",
  "pumpkin-auth",
  "pumpkin-command",
+ "pumpkin-data",
  "pumpkin-plugin-runtime",
  "pumpkin-protocol",
  "pumpkin-util",
