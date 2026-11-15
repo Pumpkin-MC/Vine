@@ -1,0 +1,23 @@
+/// Runs plugin code later or repeatedly, for work no event triggers, such as
+/// heartbeats or polling another service. Mirrors Pumpkin's scheduler, with
+/// times in milliseconds because a proxy has no ticks.
+///
+/// When a task is due, the proxy calls the plugin's `handle-task` export with
+/// the task's `handler-id`. A repeating task never overlaps itself: the next
+/// period starts counting once the previous call has returned. Tasks stop
+/// when the plugin is unloaded.
+interface scheduler {
+    /// Runs `handle-task(handler-id)` once, after `delay-ms`.
+    ///
+    /// Returns a task id for `cancel-task`.
+    schedule-delayed-task: func(handler-id: u32, delay-ms: u64) -> u32;
+
+    /// Runs `handle-task(handler-id)` after `delay-ms`, then every `period-ms`
+    /// (at least 1) until cancelled.
+    ///
+    /// Returns a task id for `cancel-task`.
+    schedule-repeating-task: func(handler-id: u32, delay-ms: u64, period-ms: u64) -> u32;
+
+    /// Cancels a task. Does nothing if it already finished or never existed.
+    cancel-task: func(task-id: u32);
+}

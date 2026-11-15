@@ -1,4 +1,5 @@
 pub mod concurrent_store;
+pub mod scheduler;
 pub mod state;
 pub mod wit;
 
@@ -122,6 +123,20 @@ impl WasmPlugin {
                 Box::pin(async move {
                     let (res,) = guest.call(func, (command_id, sender, args)).await?;
                     Ok(res)
+                })
+            })
+            .await
+    }
+}
+
+impl WasmPlugin {
+    pub async fn handle_task(&self, handler_id: u32) -> Result<(), wasmtime::Error> {
+        let func = self.instance.func_handle_task();
+        self.store
+            .call_guest(move |mut guest| {
+                Box::pin(async move {
+                    guest.call(func, (handler_id,)).await?;
+                    Ok(())
                 })
             })
             .await

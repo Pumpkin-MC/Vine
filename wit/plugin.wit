@@ -10,6 +10,7 @@ world plugin {
     import proxy;
     import context;
     import command;
+    import scheduler;
 
     /// Called once by the host to initialize the plugin instance.
     export init-plugin: func();
@@ -31,4 +32,7 @@ world plugin {
 
     /// Dispatches command suggestion / tab completion to the plugin.
     export handle-command-suggestion: func(command-id: u32, sender: command-sender, args: list<string>) -> list<string>;
+
+    /// Runs a task scheduled through the `scheduler` interface.
+    export handle-task: func(handler-id: u32);
 }
