@@ -156,11 +156,16 @@ impl CommandRuntime {
     }
 
     #[must_use]
-    pub fn loaded_plugins(&self) -> Vec<PluginMetadata> {
+    pub fn plugin_manager(&self) -> Option<Arc<PluginManager>> {
         self.plugin_manager
             .read()
             .ok()
             .and_then(|g| g.as_ref().and_then(Weak::upgrade))
+    }
+
+    #[must_use]
+    pub fn loaded_plugins(&self) -> Vec<PluginMetadata> {
+        self.plugin_manager()
             .map(|pm| pm.list_plugins())
             .unwrap_or_default()
     }

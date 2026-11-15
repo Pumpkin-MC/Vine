@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -9,6 +9,7 @@ use pumpkin_util::version::JavaMinecraftVersion;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
+use tokio::task::JoinSet;
 
 use crate::config::Config;
 use crate::plugin::PluginManager;
@@ -19,6 +20,12 @@ pub const MAX_TELEMETRY_PLAYERS: usize = 500;
 
 /// Maximum number of completed player sessions buffered between heartbeats.
 pub const MAX_COMPLETED_SESSIONS_PER_HEARTBEAT: usize = 1000;
+
+/// Maximum number of downstream backend routes included in a single heartbeat payload.
+pub const MAX_TELEMETRY_BACKENDS: usize = 64;
+
+/// Timeout per backend TCP socket probe when collecting live proxy topology status.
+const BACKEND_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// Filename used to persist the telemetry identity key across restarts.
 pub const IDENTITY_KEY_PATH: &str = ".pumpkin/identity.key";
@@ -55,6 +62,25 @@ pub struct PluginInfo {
 
 /// Type alias for plugin telemetry information.
 pub type PluginTelemetryInfo = PluginInfo;
+
+/// Telemetry descriptor for a downstream backend server configured on this Vine proxy.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ProxyBackendTelemetryInfo {
+    /// Configured route key / name in `vine.toml` (`[servers.<name>]`).
+    pub name: String,
+    /// Optional 64-character lowercase hex Ed25519 public key of the downstream server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_public_key: Option<String>,
+    /// Whether this backend is the proxy's default route (`routing.default_server`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_default: Option<bool>,
+    /// Whether the backend TCP socket accepted a probe connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_online: Option<bool>,
+    /// Number of active proxy player sessions currently routed to this backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub online_players: Option<i32>,
+}
 
 /// Client edition of a connected or disconnected player.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -319,6 +345,12 @@ pub struct HeartbeatPayload {
     /// Anonymous player sessions (`left_at: None` for currently online, `left_at: Some(...)` for disconnected).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub players: Vec<PlayerTelemetryInfo>,
+    /// Downstream backend servers configured on this Vine proxy.
+    #[serde(default)]
+    pub backends: Vec<ProxyBackendTelemetryInfo>,
+    /// Optional 64-character lowercase hex Ed25519 public key of an upstream Vine proxy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_public_key: Option<String>,
     /// Whether the server has opted into public directory listing.
     pub is_public: bool,
     /// Public name of the server if opted into public directory listing.
@@ -582,19 +614,21 @@ impl TelemetryClient {
     }
 }
 
-/// Resolves the server identity key by checking default locations or generating a new one.
+/// Resolves the proxy identity key by checking existing locations first (`.vine/identity.key`,
+/// `.pumpkin/identity.key`, `telemetry_key.bin`, and their `data/` counterparts) or generating
+/// a new persistent key at `.vine/identity.key`.
 #[must_use]
 pub fn resolve_identity_key() -> SigningKey {
-    let primary = Path::new(IDENTITY_KEY_PATH);
-    if primary.exists()
-        && let Ok(key) = TelemetryClient::load_or_generate_key(primary)
+    let vine_key = Path::new(VINE_IDENTITY_KEY_PATH);
+    if vine_key.exists()
+        && let Ok(key) = TelemetryClient::load_or_generate_key(vine_key)
     {
         return key;
     }
 
-    let vine_key = Path::new(VINE_IDENTITY_KEY_PATH);
-    if vine_key.exists()
-        && let Ok(key) = TelemetryClient::load_or_generate_key(vine_key)
+    let primary = Path::new(IDENTITY_KEY_PATH);
+    if primary.exists()
+        && let Ok(key) = TelemetryClient::load_or_generate_key(primary)
     {
         return key;
     }
@@ -606,16 +640,16 @@ pub fn resolve_identity_key() -> SigningKey {
         return key;
     }
 
-    let data_primary = Path::new("data").join(IDENTITY_KEY_PATH);
-    if data_primary.exists()
-        && let Ok(key) = TelemetryClient::load_or_generate_key(&data_primary)
+    let data_vine = Path::new("data").join(VINE_IDENTITY_KEY_PATH);
+    if data_vine.exists()
+        && let Ok(key) = TelemetryClient::load_or_generate_key(&data_vine)
     {
         return key;
     }
 
-    let data_vine = Path::new("data").join(VINE_IDENTITY_KEY_PATH);
-    if data_vine.exists()
-        && let Ok(key) = TelemetryClient::load_or_generate_key(&data_vine)
+    let data_primary = Path::new("data").join(IDENTITY_KEY_PATH);
+    if data_primary.exists()
+        && let Ok(key) = TelemetryClient::load_or_generate_key(&data_primary)
     {
         return key;
     }
@@ -628,16 +662,16 @@ pub fn resolve_identity_key() -> SigningKey {
     }
 
     if Path::new("data").is_dir() {
-        let path = Path::new("data").join(IDENTITY_KEY_PATH);
+        let path = Path::new("data").join(VINE_IDENTITY_KEY_PATH);
         if let Ok(key) = TelemetryClient::load_or_generate_key(&path) {
             return key;
         }
     }
 
-    TelemetryClient::load_or_generate_key(primary).unwrap_or_else(|err| {
+    TelemetryClient::load_or_generate_key(vine_key).unwrap_or_else(|err| {
         tracing::warn!(
             "Failed to persist telemetry identity key at {}: {err}, using ephemeral key",
-            primary.display()
+            vine_key.display()
         );
         let seed: [u8; 32] = rand::random();
         SigningKey::from_bytes(&seed)
@@ -790,10 +824,175 @@ fn collect_players_telemetry(
     players
 }
 
+/// Validates and normalizes an optional 64-character hex Ed25519 verifying key,
+/// rejecting self-references and malformed curve points.
+#[must_use]
+pub fn normalize_ed25519_pubkey_hex(raw: &str, self_pubkey_hex: Option<&str>) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.len() != 64 || !trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if self_pubkey_hex.is_some_and(|self_key| self_key.eq_ignore_ascii_case(&lower)) {
+        return None;
+    }
+    let bytes = hex::decode(&lower).ok()?;
+    VerifyingKey::try_from(bytes.as_slice()).ok()?;
+    Some(lower)
+}
+
+/// Builds deterministic telemetry entries for all configured downstream backend servers.
+#[must_use]
+pub fn collect_configured_backends_telemetry(
+    config: &Config,
+    session_manager: Option<&SessionManager>,
+    reachability: Option<&HashMap<String, bool>>,
+    self_pubkey_hex: Option<&str>,
+) -> Vec<ProxyBackendTelemetryInfo> {
+    let session_counts: Option<HashMap<String, usize>> = session_manager.map(|mgr| {
+        let mut counts = HashMap::new();
+        for session in mgr.list_sessions() {
+            *counts
+                .entry(session.current_server.to_ascii_lowercase())
+                .or_default() += 1;
+        }
+        counts
+    });
+
+    let mut entries: Vec<_> = config.servers.iter().collect();
+    entries.sort_by(|(name_a, _), (name_b, _)| {
+        let def_a = config.routing.default_server.eq_ignore_ascii_case(name_a);
+        let def_b = config.routing.default_server.eq_ignore_ascii_case(name_b);
+        def_b
+            .cmp(&def_a)
+            .then_with(|| {
+                name_a
+                    .to_ascii_lowercase()
+                    .cmp(&name_b.to_ascii_lowercase())
+            })
+            .then_with(|| name_a.cmp(name_b))
+    });
+
+    let mut out = Vec::with_capacity(entries.len().min(MAX_TELEMETRY_BACKENDS));
+    for (raw_name, backend) in entries.into_iter().take(MAX_TELEMETRY_BACKENDS) {
+        let clean_name: String = raw_name
+            .chars()
+            .filter(|c| !c.is_control() && *c != '<' && *c != '>')
+            .take(48)
+            .collect::<String>()
+            .trim()
+            .to_string();
+        if clean_name.is_empty() {
+            continue;
+        }
+
+        let server_public_key = backend
+            .public_key
+            .as_deref()
+            .and_then(|k| normalize_ed25519_pubkey_hex(k, self_pubkey_hex));
+        let is_default = Some(config.routing.default_server.eq_ignore_ascii_case(raw_name));
+        let is_online = reachability.and_then(|m| m.get(raw_name).copied());
+        let online_players = session_counts.as_ref().map(|counts| {
+            counts
+                .get(&raw_name.to_ascii_lowercase())
+                .copied()
+                .unwrap_or(0)
+                .min(100_000) as i32
+        });
+
+        out.push(ProxyBackendTelemetryInfo {
+            name: clean_name,
+            server_public_key,
+            is_default,
+            is_online,
+            online_players,
+        });
+    }
+
+    out
+}
+
+/// Concurrently probes TCP reachability of configured backend servers and returns telemetry descriptors.
+pub async fn probe_backends_telemetry(
+    config: &Config,
+    session_manager: Option<&SessionManager>,
+    self_pubkey_hex: Option<&str>,
+) -> Vec<ProxyBackendTelemetryInfo> {
+    let mut join_set = JoinSet::new();
+    for (name, backend) in config.servers.iter().take(MAX_TELEMETRY_BACKENDS) {
+        let route_name = name.clone();
+        let addr = backend.address.trim().to_string();
+        join_set.spawn(async move {
+            let reachable = !addr.is_empty()
+                && matches!(
+                    tokio::time::timeout(
+                        BACKEND_PROBE_TIMEOUT,
+                        tokio::net::TcpStream::connect(&addr)
+                    )
+                    .await,
+                    Ok(Ok(_))
+                );
+            (route_name, reachable)
+        });
+    }
+
+    let mut reachability = HashMap::new();
+    while let Some(Ok((route_name, reachable))) = join_set.join_next().await {
+        reachability.insert(route_name, reachable);
+    }
+
+    collect_configured_backends_telemetry(
+        config,
+        session_manager,
+        Some(&reachability),
+        self_pubkey_hex,
+    )
+}
+
 /// Builds the telemetry heartbeat payload from current proxy runtime state.
 #[must_use]
 pub fn build_heartbeat_payload(config: &Config, online_players: usize) -> HeartbeatPayload {
-    build_heartbeat_payload_inner(config, online_players, Vec::new(), Vec::new())
+    let backends = collect_configured_backends_telemetry(config, None, None, None);
+    build_heartbeat_payload_inner(
+        config,
+        online_players,
+        Vec::new(),
+        Vec::new(),
+        backends,
+        None,
+    )
+}
+
+/// Builds a live heartbeat snapshot (without draining buffered completed sessions) for `/vine link`.
+pub async fn build_live_heartbeat_payload(
+    config: &Config,
+    online_players: usize,
+    session_manager: &SessionManager,
+    plugin_manager: Option<&PluginManager>,
+    signing_key: &SigningKey,
+) -> HeartbeatPayload {
+    let self_pubkey_hex = hex::encode(signing_key.verifying_key().to_bytes());
+    let player_salt = derive_player_telemetry_salt(signing_key);
+    let peeked = session_manager
+        .telemetry_sessions()
+        .peek_completed(&player_salt);
+    let players = collect_players_telemetry(session_manager, &player_salt, peeked);
+    let plugins = if let Some(pm) = plugin_manager {
+        pm.active_plugins_telemetry().await
+    } else {
+        Vec::new()
+    };
+    let backends =
+        probe_backends_telemetry(config, Some(session_manager), Some(&self_pubkey_hex)).await;
+
+    build_heartbeat_payload_inner(
+        config,
+        online_players,
+        plugins,
+        players,
+        backends,
+        Some(&self_pubkey_hex),
+    )
 }
 
 fn build_heartbeat_payload_inner(
@@ -801,6 +1000,8 @@ fn build_heartbeat_payload_inner(
     online_players: usize,
     plugins: Vec<PluginInfo>,
     players: Vec<PlayerTelemetryInfo>,
+    backends: Vec<ProxyBackendTelemetryInfo>,
+    self_pubkey_hex: Option<&str>,
 ) -> HeartbeatPayload {
     let host = static_host_info();
     let ram_allocated_mb = read_used_ram_mb();
@@ -826,6 +1027,12 @@ fn build_heartbeat_payload_inner(
         None
     };
 
+    let upstream_public_key = config
+        .telemetry
+        .upstream_public_key
+        .as_deref()
+        .and_then(|k| normalize_ed25519_pubkey_hex(k, self_pubkey_hex));
+
     HeartbeatPayload {
         server_type: "vine".to_string(),
         server_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -842,26 +1049,33 @@ fn build_heartbeat_payload_inner(
         total_ram_mb: host.total_ram_mb,
         plugins,
         players,
+        backends,
+        upstream_public_key,
         is_public,
         public_name,
     }
 }
 
 pub fn start_telemetry(
-    config: Arc<Config>,
+    active_config: Arc<RwLock<Arc<Config>>>,
     online_players: Arc<AtomicUsize>,
     session_manager: Arc<SessionManager>,
     plugin_manager: Arc<PluginManager>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    if !config.telemetry.enabled {
+    let initial_config = active_config
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+
+    if !initial_config.telemetry.enabled {
         tracing::trace!("Telemetry is disabled in configuration.");
         return None;
     }
 
     tracing::info!(
         "Anonymous server telemetry is enabled. Sending periodic heartbeats to {}",
-        config.telemetry.endpoint
+        initial_config.telemetry.endpoint
     );
 
     let user_agent = format!("Vine-Proxy/{}", env!("CARGO_PKG_VERSION"));
@@ -882,16 +1096,25 @@ pub fn start_telemetry(
     let telemetry_client = Arc::new(TelemetryClient::new(
         signing_key,
         client,
-        config.telemetry.endpoint.clone(),
+        initial_config.telemetry.endpoint.clone(),
     ));
+    let self_pubkey_hex = telemetry_client.public_key_hex();
 
-    let interval_secs = config.telemetry.interval_secs.max(60);
+    let interval_secs = initial_config.telemetry.interval_secs.max(60);
 
     let handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
         loop {
             tokio::select! {
                 _ = interval.tick() => {
+                    let current_cfg = active_config
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
+                    if !current_cfg.telemetry.enabled {
+                        continue;
+                    }
+
                     let online = online_players.load(Ordering::Relaxed);
                     let (raw_completed, wire_completed) = session_manager
                         .telemetry_sessions()
@@ -899,7 +1122,20 @@ pub fn start_telemetry(
                     let players =
                         collect_players_telemetry(&session_manager, &player_salt, wire_completed);
                     let plugins = plugin_manager.active_plugins_telemetry().await;
-                    let payload = build_heartbeat_payload_inner(&config, online, plugins, players);
+                    let backends = probe_backends_telemetry(
+                        &current_cfg,
+                        Some(&session_manager),
+                        Some(&self_pubkey_hex),
+                    )
+                    .await;
+                    let payload = build_heartbeat_payload_inner(
+                        &current_cfg,
+                        online,
+                        plugins,
+                        players,
+                        backends,
+                        Some(&self_pubkey_hex),
+                    );
 
                     match telemetry_client.send_heartbeat(&payload).await {
                         Ok(resp) => {
@@ -1031,6 +1267,16 @@ mod tests {
                     left_at: Some(1_763_149_545),
                 },
             ],
+            backends: vec![ProxyBackendTelemetryInfo {
+                name: "lobby".to_string(),
+                server_public_key: Some(
+                    "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60".to_string(),
+                ),
+                is_default: Some(true),
+                is_online: Some(true),
+                online_players: Some(10),
+            }],
+            upstream_public_key: None,
             is_public: true,
             public_name: Some("My Vine Proxy".to_string()),
         };
@@ -1071,6 +1317,16 @@ mod tests {
         assert!(parsed["players"][1].get("client_brand").is_none());
         assert_eq!(parsed["players"][1]["joined_at"], 1_763_149_500);
         assert_eq!(parsed["players"][1]["left_at"], 1_763_149_545);
+        assert_eq!(parsed["backends"].as_array().unwrap().len(), 1);
+        assert_eq!(parsed["backends"][0]["name"], "lobby");
+        assert_eq!(
+            parsed["backends"][0]["server_public_key"],
+            "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
+        );
+        assert_eq!(parsed["backends"][0]["is_default"], true);
+        assert_eq!(parsed["backends"][0]["is_online"], true);
+        assert_eq!(parsed["backends"][0]["online_players"], 10);
+        assert!(parsed.get("upstream_public_key").is_none());
     }
 
     #[test]
@@ -1279,6 +1535,8 @@ mod tests {
             total_ram_mb: 2048,
             plugins: vec![],
             players: vec![],
+            backends: vec![],
+            upstream_public_key: None,
             is_public: false,
             public_name: None,
         };
@@ -1403,5 +1661,81 @@ mod tests {
         manager.telemetry_sessions().restore_completed(raw);
         let (_, restored) = manager.telemetry_sessions().take_completed(&salt);
         assert_eq!(restored.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn backend_topology_collection_and_tcp_probe() {
+        let self_key = SigningKey::from_bytes(&[1u8; 32]);
+        let self_pub = hex::encode(self_key.verifying_key().to_bytes());
+        let lobby_key = SigningKey::from_bytes(&[2u8; 32]);
+        let lobby_pub = hex::encode(lobby_key.verifying_key().to_bytes()).to_ascii_uppercase();
+
+        let live_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_addr = live_listener.local_addr().unwrap().to_string();
+
+        // Pick an unbound ephemeral port for an offline backend
+        let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead_listener.local_addr().unwrap().to_string();
+        drop(dead_listener);
+
+        let mut cfg = Config::default();
+        cfg.servers.clear();
+        cfg.routing.default_server = "lobby".to_string();
+        cfg.servers.insert(
+            "lobby".to_string(),
+            crate::config::BackendConfig {
+                address: live_addr,
+                forwarding: crate::config::ForwardingMode::Velocity,
+                secret: Some("secret".to_string()),
+                public_key: Some(lobby_pub.clone()),
+                icon_path: None,
+                motd_line1: None,
+                motd_line2: None,
+            },
+        );
+        cfg.servers.insert(
+            "survival".to_string(),
+            crate::config::BackendConfig {
+                address: dead_addr,
+                forwarding: crate::config::ForwardingMode::None,
+                secret: None,
+                // Self key must be stripped to prevent self-loop
+                public_key: Some(self_pub.clone()),
+                icon_path: None,
+                motd_line1: None,
+                motd_line2: None,
+            },
+        );
+
+        let manager = SessionManager::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        manager.register(PlayerSession {
+            username: "Alex".to_string(),
+            uuid: uuid::Uuid::new_v4(),
+            current_server: "lobby".to_string(),
+            action_tx: tx,
+            client_ip: "127.0.0.1:25565".to_string(),
+            protocol_version: 776,
+            client_brand: None,
+            locale: None,
+            view_distance: None,
+        });
+
+        let backends = probe_backends_telemetry(&cfg, Some(&manager), Some(&self_pub)).await;
+        assert_eq!(backends.len(), 2);
+        assert_eq!(backends[0].name, "lobby");
+        assert_eq!(
+            backends[0].server_public_key.as_deref(),
+            Some(lobby_pub.to_ascii_lowercase().as_str())
+        );
+        assert_eq!(backends[0].is_default, Some(true));
+        assert_eq!(backends[0].is_online, Some(true));
+        assert_eq!(backends[0].online_players, Some(1));
+
+        assert_eq!(backends[1].name, "survival");
+        assert_eq!(backends[1].server_public_key, None);
+        assert_eq!(backends[1].is_default, Some(false));
+        assert_eq!(backends[1].is_online, Some(false));
+        assert_eq!(backends[1].online_players, Some(0));
     }
 }

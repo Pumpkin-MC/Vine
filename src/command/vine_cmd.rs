@@ -20,8 +20,9 @@ use super::{
     strip_formatting_codes,
 };
 use crate::telemetry::{
-    HEADER_PUBLIC_KEY, HEADER_SIGNATURE, HEADER_TIMESTAMP, TelemetryClient,
-    build_heartbeat_payload, resolve_identity_key, sign_telemetry_payload,
+    HEADER_PUBLIC_KEY, HEADER_SIGNATURE, HEADER_TIMESTAMP, ProxyBackendTelemetryInfo,
+    TelemetryClient, build_live_heartbeat_payload, normalize_ed25519_pubkey_hex,
+    probe_backends_telemetry, resolve_identity_key, sign_telemetry_payload,
 };
 
 const DEFAULT_ACCOUNTS_URL: &str = "https://accounts.pumpkinmc.org";
@@ -36,6 +37,10 @@ struct ServerLinkInitRequest {
     minecraft_version: String,
     os: String,
     arch: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    backends: Vec<ProxyBackendTelemetryInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    upstream_public_key: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -51,12 +56,23 @@ struct ApiErrorBody {
     error: String,
 }
 
-fn resolve_accounts_base_url() -> String {
-    std::env::var("PUMPKIN_ACCOUNTS_URL")
-        .ok()
-        .map(|val| val.trim().trim_end_matches('/').to_string())
-        .filter(|val| !val.is_empty())
-        .unwrap_or_else(|| DEFAULT_ACCOUNTS_URL.to_string())
+fn resolve_link_init_url(telemetry_endpoint: &str) -> String {
+    if let Ok(val) = std::env::var("PUMPKIN_ACCOUNTS_URL") {
+        let trimmed = val.trim().trim_end_matches('/');
+        if !trimmed.is_empty() {
+            return format!("{trimmed}/api/user/servers/link/init");
+        }
+    }
+
+    let endpoint = telemetry_endpoint.trim().trim_end_matches('/');
+    if !endpoint.is_empty()
+        && !endpoint.contains("telemetry.pumpkinmc.org")
+        && let Some(prefix) = endpoint.strip_suffix("/heartbeat")
+    {
+        return format!("{prefix}/link/init");
+    }
+
+    format!("{DEFAULT_ACCOUNTS_URL}/api/user/servers/link/init")
 }
 
 fn resolve_link_server_name(
@@ -92,6 +108,8 @@ const fn is_console_only(source: &ProxyCommandSource) -> bool {
 
 fn format_link_success_message(
     resp: &ServerLinkInitResponse,
+    pubkey_hex: &str,
+    backend_count: usize,
     telemetry_enabled: bool,
 ) -> TextComponent {
     let expires_mins = resp.expires_in_secs.div_ceil(60);
@@ -130,10 +148,31 @@ fn format_link_success_message(
             ))),
     );
 
+    msg = msg.add_child(TextComponent::text("\n  Key: ").color_named(NamedColor::Gray));
+    msg = msg.add_child(
+        TextComponent::text(pubkey_hex.to_string())
+            .color_named(NamedColor::DarkAqua)
+            .click_event(ClickEvent::CopyToClipboard {
+                value: Cow::from(pubkey_hex.to_string()),
+            })
+            .hover_event(HoverEvent::show_text(TextComponent::text(
+                "Click to copy Ed25519 proxy public key",
+            ))),
+    );
+
+    if backend_count > 0 {
+        msg = msg.add_child(
+            TextComponent::text(format!(
+                "\n  Topology: {backend_count} downstream backend route(s) synced"
+            ))
+            .color_named(NamedColor::Gray),
+        );
+    }
+
     if !telemetry_enabled {
         msg = msg.add_child(
             TextComponent::text(
-                "\n  Note: Telemetry is disabled in vine.toml ([telemetry] enabled = false). Enable it to see live stats and session analytics.",
+                "\n  Note: Telemetry is disabled in vine.toml ([telemetry] enabled = false). Enable it to see live stats, topology status, and session analytics.",
             )
             .color_named(NamedColor::Yellow),
         );
@@ -143,10 +182,13 @@ fn format_link_success_message(
 }
 
 async fn request_server_link(
+    signing_key: &ed25519_dalek::SigningKey,
+    telemetry_endpoint: &str,
     server_name: String,
     minecraft_version: String,
+    backends: Vec<ProxyBackendTelemetryInfo>,
+    upstream_public_key: Option<String>,
 ) -> Result<ServerLinkInitResponse, String> {
-    let signing_key = resolve_identity_key();
     let payload = ServerLinkInitRequest {
         server_name,
         server_type: "vine".to_string(),
@@ -154,6 +196,8 @@ async fn request_server_link(
         minecraft_version,
         os: detect_host_os(),
         arch: std::env::consts::ARCH.to_string(),
+        backends,
+        upstream_public_key,
     };
 
     let body_bytes =
@@ -163,7 +207,7 @@ async fn request_server_link(
         .unwrap_or_default()
         .as_secs()
         .to_string();
-    let (pubkey_hex, sig_hex) = sign_telemetry_payload(&signing_key, &timestamp_str, &body_bytes);
+    let (pubkey_hex, sig_hex) = sign_telemetry_payload(signing_key, &timestamp_str, &body_bytes);
 
     let user_agent = format!("Vine-Proxy/{CARGO_PKG_VERSION}");
     let client = pumpkin_auth::client_builder()
@@ -172,7 +216,7 @@ async fn request_server_link(
         .build()
         .map_err(|e| format!("Failed to initialize HTTP client: {e}"))?;
 
-    let init_url = format!("{}/api/user/servers/link/init", resolve_accounts_base_url());
+    let init_url = resolve_link_init_url(telemetry_endpoint);
     let response = client
         .post(&init_url)
         .header("Content-Type", "application/json")
@@ -331,6 +375,14 @@ impl CommandExecutor<ProxyCommandSource> for VineServersExecutor {
                 {
                     tags.push("fallback");
                 }
+                if backend
+                    .public_key
+                    .as_deref()
+                    .and_then(|k| normalize_ed25519_pubkey_hex(k, None))
+                    .is_some()
+                {
+                    tags.push("key-pinned");
+                }
                 let tag_suffix = if tags.is_empty() {
                     String::new()
                 } else {
@@ -378,7 +430,11 @@ impl CommandExecutor<ProxyCommandSource> for VineReloadExecutor {
     }
 }
 
-fn execute_link(context: &CommandContext<ProxyCommandSource>, custom_name: Option<&str>) -> i32 {
+fn execute_link(
+    context: &CommandContext<ProxyCommandSource>,
+    runtime: &CommandRuntime,
+    custom_name: Option<&str>,
+) -> i32 {
     if !is_console_only(&context.source) {
         context.source.send_message(
             TextComponent::text(
@@ -389,7 +445,7 @@ fn execute_link(context: &CommandContext<ProxyCommandSource>, custom_name: Optio
         return 0;
     }
 
-    let cfg = &context.source.config;
+    let cfg = context.source.config.clone();
     let server_name = resolve_link_server_name(
         custom_name,
         cfg.telemetry.server_name.as_deref(),
@@ -404,12 +460,7 @@ fn execute_link(context: &CommandContext<ProxyCommandSource>, custom_name: Optio
     };
 
     let telemetry_enabled = cfg.telemetry.enabled;
-    let immediate_heartbeat = telemetry_enabled.then(|| {
-        (
-            cfg.telemetry.endpoint.clone(),
-            build_heartbeat_payload(cfg, context.source.session_manager.count()),
-        )
-    });
+    let plugin_manager = runtime.plugin_manager();
 
     let Ok(rt_handle) = tokio::runtime::Handle::try_current() else {
         context.source.send_message(
@@ -426,19 +477,62 @@ fn execute_link(context: &CommandContext<ProxyCommandSource>, custom_name: Optio
 
     let source = context.source.clone();
     rt_handle.spawn(async move {
-        if let Some((endpoint, hb_payload)) = immediate_heartbeat
-            && let Ok(http_client) = pumpkin_auth::client_builder()
+        let signing_key = resolve_identity_key();
+        let self_pubkey_hex = hex::encode(signing_key.verifying_key().to_bytes());
+        let online_count = source.session_manager.count();
+
+        let backends = if telemetry_enabled {
+            let hb_payload = build_live_heartbeat_payload(
+                &cfg,
+                online_count,
+                &source.session_manager,
+                plugin_manager.as_deref(),
+                &signing_key,
+            )
+            .await;
+
+            if let Ok(http_client) = pumpkin_auth::client_builder()
                 .user_agent(format!("Vine-Proxy/{CARGO_PKG_VERSION}"))
                 .timeout(HTTP_TIMEOUT)
                 .build()
-        {
-            let client = TelemetryClient::new(resolve_identity_key(), http_client, endpoint);
-            let _ = client.send_heartbeat(&hb_payload).await;
-        }
+            {
+                let client = TelemetryClient::new(
+                    signing_key.clone(),
+                    http_client,
+                    cfg.telemetry.endpoint.clone(),
+                );
+                let _ = client.send_heartbeat(&hb_payload).await;
+            }
+            hb_payload.backends
+        } else {
+            probe_backends_telemetry(&cfg, Some(&source.session_manager), Some(&self_pubkey_hex))
+                .await
+        };
 
-        match request_server_link(server_name, minecraft_version).await {
+        let backend_count = backends.len();
+        let upstream_public_key = cfg
+            .telemetry
+            .upstream_public_key
+            .as_deref()
+            .and_then(|k| normalize_ed25519_pubkey_hex(k, Some(&self_pubkey_hex)));
+
+        match request_server_link(
+            &signing_key,
+            &cfg.telemetry.endpoint,
+            server_name,
+            minecraft_version,
+            backends,
+            upstream_public_key,
+        )
+        .await
+        {
             Ok(resp) => {
-                source.send_message(format_link_success_message(&resp, telemetry_enabled));
+                source.send_message(format_link_success_message(
+                    &resp,
+                    &self_pubkey_hex,
+                    backend_count,
+                    telemetry_enabled,
+                ));
             }
             Err(err) => {
                 source.send_message(
@@ -452,20 +546,24 @@ fn execute_link(context: &CommandContext<ProxyCommandSource>, custom_name: Optio
     1
 }
 
-struct VineLinkExecutor;
+struct VineLinkExecutor {
+    runtime: Arc<CommandRuntime>,
+}
 
 impl CommandExecutor<ProxyCommandSource> for VineLinkExecutor {
     fn execute(&self, context: &CommandContext<ProxyCommandSource>) -> CommandExecutorResult {
-        Ok(execute_link(context, None))
+        Ok(execute_link(context, &self.runtime, None))
     }
 }
 
-struct VineLinkNamedExecutor;
+struct VineLinkNamedExecutor {
+    runtime: Arc<CommandRuntime>,
+}
 
 impl CommandExecutor<ProxyCommandSource> for VineLinkNamedExecutor {
     fn execute(&self, context: &CommandContext<ProxyCommandSource>) -> CommandExecutorResult {
         let name = StringArgumentType::get(context, "name")?;
-        Ok(execute_link(context, Some(name)))
+        Ok(execute_link(context, &self.runtime, Some(name)))
     }
 }
 
@@ -492,15 +590,19 @@ pub fn register(
             .then(
                 literal("reload")
                     .requires(Requirement::from("vine.command.reload"))
-                    .executes(VineReloadExecutor { runtime }),
+                    .executes(VineReloadExecutor {
+                        runtime: runtime.clone(),
+                    }),
             )
             .then(
                 literal("link")
                     .requires(is_console_only)
-                    .executes(VineLinkExecutor)
+                    .executes(VineLinkExecutor {
+                        runtime: runtime.clone(),
+                    })
                     .then(
                         argument("name", StringArgumentType::GreedyPhrase)
-                            .executes(VineLinkNamedExecutor),
+                            .executes(VineLinkNamedExecutor { runtime }),
                     ),
             ),
     );
@@ -546,6 +648,14 @@ mod tests {
             minecraft_version: "26.2".to_string(),
             os: "Linux".to_string(),
             arch: "x86_64".to_string(),
+            backends: vec![ProxyBackendTelemetryInfo {
+                name: "lobby".to_string(),
+                server_public_key: None,
+                is_default: Some(true),
+                is_online: Some(true),
+                online_players: Some(3),
+            }],
+            upstream_public_key: None,
         };
         let body = serde_json::to_vec(&req).unwrap();
         let ts = "1700000000";

@@ -249,8 +249,12 @@ pub struct BackendConfig {
     pub address: String,
     /// Forwarding mode to use when connecting to this backend
     pub forwarding: ForwardingMode,
-    /// Secret key required if forwarding mode is Velocity
+    /// Secret key required if forwarding mode is Velocity or Vine
     pub secret: Option<String>,
+    /// Optional 64-character hex Ed25519 telemetry public key of this backend server
+    /// for cryptographic topology verification in Pumpkin Account
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
     /// Optional custom 64x64 PNG status icon path for this backend / virtual host
     #[serde(default)]
     pub icon_path: Option<String>,
@@ -288,6 +292,10 @@ pub struct TelemetryConfig {
     /// Public server/proxy name displayed on the analytics dashboard if public is true.
     #[serde(default)]
     pub server_name: Option<String>,
+    /// Optional 64-character hex Ed25519 telemetry public key of an upstream Vine proxy
+    /// when running a multi-tier proxy hierarchy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_public_key: Option<String>,
 }
 
 impl Default for TelemetryConfig {
@@ -298,6 +306,7 @@ impl Default for TelemetryConfig {
             interval_secs: 300,
             public: false,
             server_name: None,
+            upstream_public_key: None,
         }
     }
 }
@@ -311,6 +320,7 @@ impl Default for Config {
                 address: "127.0.0.1:25566".to_string(),
                 forwarding: ForwardingMode::Velocity,
                 secret: Some("vine-velocity-secret-change-me".to_string()),
+                public_key: None,
                 icon_path: None,
                 motd_line1: None,
                 motd_line2: None,
@@ -322,6 +332,7 @@ impl Default for Config {
                 address: "127.0.0.1:25567".to_string(),
                 forwarding: ForwardingMode::BungeeCord,
                 secret: None,
+                public_key: None,
                 icon_path: None,
                 motd_line1: Some("§b§lVine Survival §7» §fWelcome back!".to_string()),
                 motd_line2: Some("§7Custom world • Economy • Land Claims".to_string()),
@@ -333,6 +344,7 @@ impl Default for Config {
                 address: "127.0.0.1:25568".to_string(),
                 forwarding: ForwardingMode::None,
                 secret: None,
+                public_key: None,
                 icon_path: None,
                 motd_line1: None,
                 motd_line2: None,
@@ -422,6 +434,7 @@ mod tests {
         assert_eq!(default_config.interval_secs, 300);
         assert!(!default_config.public);
         assert_eq!(default_config.server_name, None);
+        assert_eq!(default_config.upstream_public_key, None);
     }
 
     #[test]
@@ -432,6 +445,7 @@ mod tests {
             interval_secs = 120
             public = true
             server_name = "Vine Proxy Hub"
+            upstream_public_key = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
         "#;
 
         let config: TelemetryConfig = toml::from_str(toml_str).unwrap();
@@ -440,5 +454,9 @@ mod tests {
         assert_eq!(config.interval_secs, 120);
         assert!(config.public);
         assert_eq!(config.server_name.as_deref(), Some("Vine Proxy Hub"));
+        assert_eq!(
+            config.upstream_public_key.as_deref(),
+            Some("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+        );
     }
 }

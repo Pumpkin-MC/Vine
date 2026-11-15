@@ -283,6 +283,7 @@ mod tests {
                 address: "127.0.0.1:25567".to_string(),
                 forwarding: ForwardingMode::None,
                 secret: None,
+                public_key: None,
                 icon_path: None,
                 motd_line1: Some("Survival Line 1".to_string()),
                 motd_line2: Some("Survival Line 2".to_string()),

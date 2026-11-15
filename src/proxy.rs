@@ -331,7 +331,7 @@ impl ProxyServer {
         }
 
         let telemetry_handle = telemetry::start_telemetry(
-            startup_config.clone(),
+            self.active_config.clone(),
             self.online_players.clone(),
             self.session_manager.clone(),
             self.plugin_manager.clone(),
