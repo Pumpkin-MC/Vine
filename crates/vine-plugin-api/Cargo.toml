@@ -1,0 +1,14 @@
+[package]
+name = "vine-plugin-api"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "GPL-3.0"
+description = "Rust WebAssembly Plugin SDK for the Vine Minecraft Proxy"
+
+[dependencies]
+wit-bindgen = { version = "0.63", default-features = false, features = ["macros"] }
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
+
+[package.metadata.component]
+target = { path = "../../wit", world = "plugin" }
