@@ -14,25 +14,30 @@ pub struct ProxyHeaderResult {
 
 /// Reads and parses HAProxy PROXY protocol (v1 or v2) from an incoming stream.
 /// Returns the client address and any leftover bytes read past the header.
+///
+/// Returns `Ok(None)` if the peer closed the connection without sending any bytes,
+/// as plain TCP health checks and port scanners do.
 pub async fn parse_proxy_protocol<R: AsyncRead + Unpin>(
     reader: &mut R,
     fallback_addr: SocketAddr,
-) -> Result<ProxyHeaderResult, io::Error> {
+) -> Result<Option<ProxyHeaderResult>, io::Error> {
     let mut initial_buf = [0u8; 512];
-    let n = reader.read(&mut initial_buf).await?;
-    if n == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "Stream closed before reading PROXY header",
-        ));
-    }
+    let n = match reader.read(&mut initial_buf).await {
+        Ok(0) => return Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::ConnectionReset => return Ok(None),
+        res => res?,
+    };
 
     if n >= 12 && initial_buf[..12] == PROXY_V2_MAGIC {
-        return parse_proxy_v2(reader, fallback_addr, &initial_buf[..n]).await;
+        return parse_proxy_v2(reader, fallback_addr, &initial_buf[..n])
+            .await
+            .map(Some);
     }
 
     if n >= 6 && &initial_buf[..6] == b"PROXY " {
-        return parse_proxy_v1(reader, fallback_addr, &initial_buf[..n]).await;
+        return parse_proxy_v1(reader, fallback_addr, &initial_buf[..n])
+            .await
+            .map(Some);
     }
 
     Err(io::Error::new(
@@ -253,7 +258,10 @@ mod tests {
     async fn test_proxy_v1_ipv4() {
         let mut data = Cursor::new(b"PROXY TCP4 198.51.100.22 192.0.2.1 54321 25565\r\nHello");
         let fallback = "127.0.0.1:1234".parse().unwrap();
-        let res = parse_proxy_protocol(&mut data, fallback).await.unwrap();
+        let res = parse_proxy_protocol(&mut data, fallback)
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(
             res.client_addr,
@@ -266,7 +274,10 @@ mod tests {
     async fn test_proxy_v1_unknown() {
         let mut data = Cursor::new(b"PROXY UNKNOWN\r\nMinecraftPayload");
         let fallback = "127.0.0.1:1234".parse().unwrap();
-        let res = parse_proxy_protocol(&mut data, fallback).await.unwrap();
+        let res = parse_proxy_protocol(&mut data, fallback)
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(res.client_addr, fallback);
         assert_eq!(res.leftover_bytes, b"MinecraftPayload");
@@ -287,12 +298,33 @@ mod tests {
 
         let mut cursor = Cursor::new(payload);
         let fallback = "127.0.0.1:1234".parse().unwrap();
-        let res = parse_proxy_protocol(&mut cursor, fallback).await.unwrap();
+        let res = parse_proxy_protocol(&mut cursor, fallback)
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(
             res.client_addr,
             "10.0.0.99:45678".parse::<SocketAddr>().unwrap()
         );
         assert_eq!(res.leftover_bytes, b"MC_PACKET");
+    }
+
+    #[tokio::test]
+    async fn test_closed_before_any_bytes() {
+        let mut data = Cursor::new(b"");
+        let fallback = "127.0.0.1:1234".parse().unwrap();
+        let res = parse_proxy_protocol(&mut data, fallback).await.unwrap();
+
+        assert_eq!(res, None);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_header_is_error() {
+        let mut data = Cursor::new(b"GET / HTTP/1.1\r\n\r\n");
+        let fallback = "127.0.0.1:1234".parse().unwrap();
+        let err = parse_proxy_protocol(&mut data, fallback).await.unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

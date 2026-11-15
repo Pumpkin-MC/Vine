@@ -268,10 +268,14 @@ impl ProxyServer {
 
                                 if config.network.proxy_protocol {
                                     match network::parse_proxy_protocol(&mut stream, peer_addr).await {
-                                        Ok(res) => {
+                                        Ok(Some(res)) => {
                                              effective_addr = res.client_addr;
                                              leftover_bytes = res.leftover_bytes;
                                              debug!("[{}] PROXY protocol resolved client IP: {}", peer_addr, effective_addr);
+                                        }
+                                        Ok(None) => {
+                                            debug!("[{}] Connection closed before sending a PROXY header", peer_addr);
+                                            return;
                                         }
                                         Err(err) => {
                                             warn!("[{}] Dropped connection: PROXY protocol error: {}", peer_addr, err);
