@@ -26,7 +26,9 @@ use crate::command::CommandDispatcher;
 use crate::config::Config;
 use crate::network::PrefixedRead;
 use crate::plugin::PluginManager;
-use crate::plugin::api::{PlayerLoginEvent, PlayerPreLoginEvent, ProxyPingEvent};
+use crate::plugin::api::{
+    PlayerDisconnectEvent, PlayerLoginEvent, PlayerPreLoginEvent, ProxyPingEvent,
+};
 use crate::security::Sanitizer;
 use crate::session::SessionManager;
 use crate::status::StatusHandler;
@@ -419,6 +421,47 @@ impl ClientHandler {
             return Ok(());
         }
 
+        let uuid = authenticated_player.id.to_string();
+        let username = authenticated_player.username.clone();
+        let reached_backend = self
+            .connect_to_backend(
+                decoder,
+                encoder,
+                client_version,
+                virtual_host,
+                client_ip,
+                authenticated_player,
+            )
+            .await;
+
+        // Every login that passed `player-login` gets exactly one `player-disconnect`.
+        // `BackendBridge` fires it once the player has reached a backend; when the
+        // login ends before that, fire it here with no last server.
+        if !matches!(reached_backend, Ok(true)) {
+            let disconnect_event = PlayerDisconnectEvent {
+                uuid,
+                username,
+                last_server: None,
+            };
+            self.plugin_manager
+                .fire_player_disconnect(&disconnect_event)
+                .await;
+        }
+        reached_backend.map(|_| ())
+    }
+
+    /// Picks the initial backend for a logged-in player and hands the connection to
+    /// [`BackendBridge`]. Returns `Ok(true)` if the player reached a backend, in which
+    /// case the bridge has already fired `player-disconnect`.
+    async fn connect_to_backend(
+        &self,
+        mut decoder: TCPNetworkDecoder<PrefixedRead<OwnedReadHalf>>,
+        mut encoder: TCPNetworkEncoder<OwnedWriteHalf>,
+        client_version: JavaMinecraftVersion,
+        virtual_host: String,
+        client_ip: IpAddr,
+        authenticated_player: AuthenticatedPlayer,
+    ) -> Result<bool, ClientError> {
         let comp_threshold = self.config.server.compression_threshold;
         if comp_threshold > 0 {
             let set_comp = CSetCompression::new(VarInt(comp_threshold));
@@ -454,7 +497,7 @@ impl ClientHandler {
                     "No default or matching backend Minecraft server is configured on the proxy.",
                 )
                 .await?;
-                return Ok(());
+                return Ok(false);
             }
         };
 
@@ -492,7 +535,7 @@ impl ClientHandler {
         );
 
         bridge.run(decoder, encoder).await?;
-        Ok(())
+        Ok(true)
     }
 
     /// Helper to send formatted CLoginDisconnect packet to client
