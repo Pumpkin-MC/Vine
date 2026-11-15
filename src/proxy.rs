@@ -92,7 +92,7 @@ impl ProxyServer {
         let plugins_dir = PathBuf::from(&config.plugins.plugin_dir);
         let plugin_manager = crate::plugin::PluginManager::new(plugins_dir)?;
         plugin_manager.init_proxy_context(
-            config.clone(),
+            active_config.clone(),
             session_manager.clone(),
             command_dispatcher.clone(),
         );

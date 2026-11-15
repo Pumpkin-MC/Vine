@@ -12,16 +12,16 @@ pub struct WasmPluginLoader {
 }
 
 impl WasmPluginLoader {
-    pub fn new() -> Result<Self, wasm_host::PluginInitError> {
-        let runtime = PluginRuntime::new()?;
+    pub fn new(plugins_dir: &Path) -> Result<Self, wasm_host::PluginInitError> {
+        let runtime = PluginRuntime::new(plugins_dir)?;
         Ok(Self { runtime })
     }
 
+    #[must_use]
     pub fn can_load(&self, path: &Path) -> bool {
         path.extension()
             .and_then(|e| e.to_str())
-            .map(|ext| ext.eq_ignore_ascii_case("wasm"))
-            .unwrap_or(false)
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("wasm"))
     }
 
     pub async fn load(

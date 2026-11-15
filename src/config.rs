@@ -65,11 +65,69 @@ pub struct Config {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PluginConfig {
+    /// Whether the WebAssembly plugin system is enabled.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Directory from which `.wasm` plugin components are loaded.
     #[serde(default = "default_plugins_dir")]
     pub plugin_dir: String,
+    /// Whether to verify Ed25519 WASM signatures on plugins during loading.
+    #[serde(default)]
+    pub verify_signatures: bool,
+    /// Whether unsigned plugins are permitted when `verify_signatures` is enabled.
+    #[serde(default = "default_true")]
+    pub allow_unsigned: bool,
+    /// Trusted 64-character hex Ed25519 public keys accepted for signed WASM plugins.
+    #[serde(default)]
+    pub trusted_public_keys: Vec<String>,
+    /// Permissions globally blocked across all plugins (e.g. `["network.outbound"]`).
+    #[serde(default)]
+    pub blocked_permissions: Vec<String>,
+    /// Whether host environment variables are inherited by WASI plugins by default.
+    #[serde(default)]
+    pub inherit_env: bool,
+    /// Whether plugin WASI network sockets are restricted to loopback (`127.0.0.1` / `::1`) by default.
+    #[serde(default)]
+    pub loopback_only: bool,
+    /// Optional global maximum linear memory limit in megabytes (MB) per plugin instance.
+    #[serde(default)]
+    pub max_memory_mb: Option<u64>,
+    /// Per-plugin configuration overrides keyed by plugin metadata name.
+    #[serde(default)]
+    pub overrides: HashMap<String, PluginOverride>,
+}
+
+/// Per-plugin security and resource overrides.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PluginOverride {
+    /// Whether this specific plugin is enabled.
+    pub enabled: bool,
+    /// Optional override for allowing unsigned execution when `verify_signatures = true`.
+    pub allow_unsigned: Option<bool>,
+    /// Optional maximum memory limit in megabytes (MB) for this specific plugin.
+    pub max_memory_mb: Option<u64>,
+    /// Additional permissions blocked specifically for this plugin.
+    pub blocked_permissions: Vec<String>,
+    /// Optional override for restricting network sockets to loopback addresses.
+    pub loopback_only: Option<bool>,
+    /// Custom environment variables injected into this plugin's WASI context.
+    pub environment: HashMap<String, String>,
+}
+
+impl Default for PluginOverride {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allow_unsigned: None,
+            max_memory_mb: None,
+            blocked_permissions: Vec::new(),
+            loopback_only: None,
+            environment: HashMap::new(),
+        }
+    }
 }
 
 fn default_plugins_dir() -> String {
@@ -81,6 +139,14 @@ impl Default for PluginConfig {
         Self {
             enabled: true,
             plugin_dir: default_plugins_dir(),
+            verify_signatures: false,
+            allow_unsigned: true,
+            trusted_public_keys: Vec::new(),
+            blocked_permissions: Vec::new(),
+            inherit_env: false,
+            loopback_only: false,
+            max_memory_mb: None,
+            overrides: HashMap::new(),
         }
     }
 }
@@ -457,6 +523,59 @@ mod tests {
         assert_eq!(
             config.upstream_public_key.as_deref(),
             Some("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+        );
+    }
+
+    #[test]
+    fn test_plugin_config_defaults_and_overrides_toml() {
+        let defaults = PluginConfig::default();
+        assert!(!defaults.verify_signatures);
+        assert!(defaults.allow_unsigned);
+        assert!(defaults.trusted_public_keys.is_empty());
+        assert!(defaults.blocked_permissions.is_empty());
+        assert!(!defaults.inherit_env);
+        assert!(!defaults.loopback_only);
+        assert_eq!(defaults.max_memory_mb, None);
+        assert!(defaults.overrides.is_empty());
+
+        let toml_str = r#"
+            verify_signatures = true
+            allow_unsigned = false
+            trusted_public_keys = ["0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"]
+            blocked_permissions = ["http.outbound"]
+            inherit_env = false
+            loopback_only = true
+            max_memory_mb = 64
+
+            [overrides.hub-router]
+            enabled = true
+            allow_unsigned = true
+            blocked_permissions = ["fs.write.data"]
+            max_memory_mb = 32
+            loopback_only = false
+            environment = { API_URL = "http://127.0.0.1:8080" }
+        "#;
+
+        let parsed: PluginConfig = toml::from_str(toml_str).unwrap();
+        assert!(parsed.verify_signatures);
+        assert!(!parsed.allow_unsigned);
+        assert_eq!(parsed.trusted_public_keys.len(), 1);
+        assert_eq!(parsed.blocked_permissions, vec!["http.outbound"]);
+        assert!(parsed.loopback_only);
+        assert_eq!(parsed.max_memory_mb, Some(64));
+
+        let hub = parsed
+            .overrides
+            .get("hub-router")
+            .expect("override present");
+        assert!(hub.enabled);
+        assert_eq!(hub.allow_unsigned, Some(true));
+        assert_eq!(hub.blocked_permissions, vec!["fs.write.data"]);
+        assert_eq!(hub.max_memory_mb, Some(32));
+        assert_eq!(hub.loopback_only, Some(false));
+        assert_eq!(
+            hub.environment.get("API_URL").map(String::as_str),
+            Some("http://127.0.0.1:8080")
         );
     }
 }

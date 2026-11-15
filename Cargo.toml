@@ -13,6 +13,9 @@ pumpkin-command = { git = "https://github.com/Pumpkin-MC/Pumpkin", rev = "82705d
 pumpkin-plugin-runtime = { git = "https://github.com/Pumpkin-MC/Pumpkin", rev = "82705d5362681d091bbec928013989d51e7895ec" }
 wasmtime = { version = "50.0.1", default-features = false, features = ["runtime", "component-model", "component-model-async", "async", "cache", "cranelift", "gc", "gc-drc", "threads", "std"] }
 wasmtime-wasi = { version = "50.0.1", default-features = false, features = ["p2", "p3"] }
+wasmtime-wasi-http = { version = "50.0.1", default-features = false, features = ["p2", "p3", "default-send-request"] }
+hyper = { version = "^1.12", default-features = false }
+wasmparser = { version = "0.262", default-features = false, features = ["component-model", "std"] }
 
 tokio = { version = "1.54", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -48,7 +51,15 @@ sysinfo = { version = "0.40", default-features = false, features = ["system"] }
 
 [dev-dependencies]
 tempfile = "3"
+wasm-encoder = { version = "0.262", default-features = false, features = ["component-model", "std"] }
+wit-component = "0.262"
+wit-parser = "0.262"
 
 [profile.release]
 lto = true
 codegen-units = 1
+
+[workspace]
+resolver = "3"
+members = [".", "crates/vine-plugin-api"]
+default-members = [".", "crates/vine-plugin-api"]

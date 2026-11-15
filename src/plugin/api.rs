@@ -13,6 +13,8 @@ pub struct PluginMetadata {
     pub authors: Vec<String>,
     pub description: Option<String>,
     pub dependencies: Vec<String>,
+    #[serde(default)]
+    pub permissions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

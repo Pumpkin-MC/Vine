@@ -1,15 +1,16 @@
 pub mod api;
 pub mod loader;
+pub mod permissions;
 
 pub use api::*;
 pub use loader::wasm::WasmPlugin;
 use loader::wasm::WasmPluginLoader;
 use loader::wasm::wasm_host::state::ProxyPluginContext;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as SyncRwLock};
 use tokio::sync::{OnceCell, RwLock};
 use tracing::{error, info, warn};
 
@@ -23,11 +24,142 @@ pub struct RegisteredEventHandler {
     pub plugin: Arc<WasmPlugin>,
 }
 
+/// Sanitizes a plugin name into a safe single directory component under `plugins/data/`.
+#[must_use]
+pub fn sanitize_plugin_dir_name(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = sanitized.trim_matches('_');
+    if trimmed.is_empty() {
+        "unnamed_plugin".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+pub type DependencySortResult<T> = (Vec<(T, PluginMetadata)>, Vec<(String, String)>);
+
+/// Orders plugins topologically so every plugin loads after all of its `dependencies`.
+///
+/// Plugins with missing or cyclic dependencies are excluded and returned in the second tuple element
+/// alongside a human-readable reason.
+pub fn sort_plugins_by_dependencies<T>(
+    candidates: Vec<(T, PluginMetadata)>,
+) -> DependencySortResult<T> {
+    let mut by_name: BTreeMap<String, (T, PluginMetadata)> = BTreeMap::new();
+    let mut skipped: Vec<(String, String)> = Vec::new();
+
+    for (item, meta) in candidates {
+        if meta.name.trim().is_empty() {
+            skipped.push((
+                "<empty>".to_string(),
+                "plugin metadata name cannot be empty".to_string(),
+            ));
+            continue;
+        }
+        if by_name.contains_key(&meta.name) {
+            skipped.push((
+                meta.name.clone(),
+                format!("duplicate plugin name '{}'", meta.name),
+            ));
+            continue;
+        }
+        by_name.insert(meta.name.clone(), (item, meta));
+    }
+
+    // Iteratively prune any plugin whose dependency is missing.
+    loop {
+        let missing: Vec<(String, String)> = by_name
+            .iter()
+            .filter_map(|(name, (_, meta))| {
+                meta.dependencies
+                    .iter()
+                    .find(|dep| !by_name.contains_key(*dep))
+                    .map(|missing_dep| {
+                        (
+                            name.clone(),
+                            format!("missing required dependency '{missing_dep}'"),
+                        )
+                    })
+            })
+            .collect();
+
+        if missing.is_empty() {
+            break;
+        }
+        for (name, reason) in missing {
+            by_name.remove(&name);
+            skipped.push((name, reason));
+        }
+    }
+
+    let mut in_degree: BTreeMap<String, usize> = BTreeMap::new();
+    let mut dependents: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (name, (_, meta)) in &by_name {
+        let unique_deps: HashSet<&String> = meta.dependencies.iter().collect();
+        in_degree.insert(name.clone(), unique_deps.len());
+        for dep in unique_deps {
+            dependents
+                .entry(dep.clone())
+                .or_default()
+                .push(name.clone());
+        }
+    }
+    for list in dependents.values_mut() {
+        list.sort();
+    }
+
+    let mut ready: VecDeque<String> = in_degree
+        .iter()
+        .filter(|(_, deg)| **deg == 0)
+        .map(|(name, _)| name.clone())
+        .collect();
+
+    let mut ordered = Vec::with_capacity(by_name.len());
+    while let Some(name) = ready.pop_front() {
+        if let Some(entry) = by_name.remove(&name) {
+            ordered.push(entry);
+        }
+        if let Some(children) = dependents.get(&name) {
+            let mut newly_ready = Vec::new();
+            for child in children {
+                if let Some(deg) = in_degree.get_mut(child) {
+                    *deg = deg.saturating_sub(1);
+                    if *deg == 0 {
+                        newly_ready.push(child.clone());
+                    }
+                }
+            }
+            newly_ready.sort();
+            for n in newly_ready {
+                ready.push_back(n);
+            }
+        }
+    }
+
+    for name in by_name.into_keys() {
+        skipped.push((
+            name,
+            "circular plugin dependency cycle detected".to_string(),
+        ));
+    }
+
+    (ordered, skipped)
+}
+
 pub struct PluginManager {
     plugins_dir: PathBuf,
     loader: WasmPluginLoader,
     loaded_plugins: RwLock<Vec<Arc<WasmPlugin>>>,
-    loaded_metadata: std::sync::RwLock<Vec<PluginMetadata>>,
+    loaded_metadata: SyncRwLock<Vec<(PluginMetadata, String)>>,
     event_handlers: RwLock<HashMap<EventType, Vec<RegisteredEventHandler>>>,
     proxy_ctx: OnceCell<ProxyPluginContext>,
 }
@@ -36,12 +168,12 @@ impl PluginManager {
     pub fn new(
         plugins_dir: PathBuf,
     ) -> Result<Arc<Self>, loader::wasm::wasm_host::PluginInitError> {
-        let loader = WasmPluginLoader::new()?;
+        let loader = WasmPluginLoader::new(&plugins_dir)?;
         Ok(Arc::new(Self {
             plugins_dir,
             loader,
             loaded_plugins: RwLock::new(Vec::new()),
-            loaded_metadata: std::sync::RwLock::new(Vec::new()),
+            loaded_metadata: SyncRwLock::new(Vec::new()),
             event_handlers: RwLock::new(HashMap::new()),
             proxy_ctx: OnceCell::new(),
         }))
@@ -49,12 +181,12 @@ impl PluginManager {
 
     pub fn init_proxy_context(
         self: &Arc<Self>,
-        config: Arc<crate::config::Config>,
+        active_config: Arc<SyncRwLock<Arc<crate::config::Config>>>,
         session_manager: Arc<crate::session::SessionManager>,
         command_dispatcher: Arc<crate::command::CommandDispatcher>,
     ) {
         let ctx = ProxyPluginContext {
-            config,
+            active_config,
             session_manager,
             command_dispatcher,
             plugin_manager: self.clone(),
@@ -95,32 +227,33 @@ impl PluginManager {
             for cmd_name in names {
                 let plugin_cmd = plugin.clone();
                 let perm_check = permission.clone();
-                let cmd_builder = pumpkin_command::argument_builder::command(cmd_name, description.clone())
-                    .requires(move |src: &ProxyCommandSource| {
-                        if let Some(ref p) = perm_check {
-                            src.has_permission(p)
-                        } else {
-                            true
-                        }
-                    })
-                    .executes(PluginCommandExecutor {
-                        command_id,
-                        plugin: plugin_cmd.clone(),
-                    })
-                    .then(
-                        pumpkin_command::argument_builder::argument(
-                            "args",
-                            pumpkin_command::argument_types::core::string::StringArgumentType::GreedyPhrase,
-                        )
-                        .suggests(PluginCommandSuggestionProvider {
-                            command_id,
-                            plugin: plugin_cmd.clone(),
+                let cmd_builder =
+                    pumpkin_command::argument_builder::command(cmd_name, description.clone())
+                        .requires(move |src: &ProxyCommandSource| {
+                            if let Some(ref p) = perm_check {
+                                src.has_permission(p)
+                            } else {
+                                true
+                            }
                         })
                         .executes(PluginCommandExecutor {
                             command_id,
-                            plugin: plugin_cmd,
-                        }),
-                    );
+                            plugin: plugin_cmd.clone(),
+                        })
+                        .then(
+                            pumpkin_command::argument_builder::argument(
+                                "args",
+                                pumpkin_command::argument_types::core::string::StringArgumentType::GreedyPhrase,
+                            )
+                            .suggests(PluginCommandSuggestionProvider {
+                                command_id,
+                                plugin: plugin_cmd.clone(),
+                            })
+                            .executes(PluginCommandExecutor {
+                                command_id,
+                                plugin: plugin_cmd,
+                            }),
+                        );
                 proxy.command_dispatcher.register(cmd_builder);
             }
             info!(
@@ -137,7 +270,6 @@ impl PluginManager {
             return Ok(0);
         }
 
-        let mut count = 0;
         let start_time = std::time::Instant::now();
         let read_dir = match fs::read_dir(&self.plugins_dir) {
             Ok(d) => d,
@@ -148,38 +280,92 @@ impl PluginManager {
         };
 
         let proxy = self.proxy_ctx.get().cloned();
+        let plugin_cfg = proxy
+            .as_ref()
+            .map(|p| p.current_config().plugins.clone())
+            .unwrap_or_default();
 
-        for entry in read_dir.flatten() {
-            let path = entry.path();
-            if path.is_file() && self.loader.can_load(&path) {
-                info!("Loading plugin from '{}'...", path.display());
-                match self.loader.load(&path, proxy.clone()).await {
-                    Ok((plugin, metadata)) => {
-                        let data_folder =
-                            PathBuf::from("plugins").join("data").join(&metadata.name);
-                        let context = Arc::new(PluginContext::new(metadata.clone(), data_folder));
-                        match plugin.on_load(context).await {
-                            Ok(()) => {
-                                info!(
-                                    "Loaded plugin '{}' v{} by {}",
-                                    metadata.name,
-                                    metadata.version,
-                                    metadata.authors.join(", ")
-                                );
-                                if let Ok(mut meta_guard) = self.loaded_metadata.write() {
-                                    meta_guard.push(metadata);
-                                }
-                                self.loaded_plugins.write().await.push(plugin);
-                                count += 1;
-                            }
-                            Err(e) => {
-                                error!("Plugin '{}' failed to on_load: {}", metadata.name, e);
-                            }
+        let mut paths: Vec<PathBuf> = read_dir
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_file() && self.loader.can_load(p))
+            .collect();
+        paths.sort();
+
+        let mut initialized: Vec<(Arc<WasmPlugin>, PluginMetadata)> = Vec::new();
+        for path in paths {
+            info!("Loading plugin from '{}'...", path.display());
+            match self.loader.load(&path, proxy.clone()).await {
+                Ok((plugin, metadata)) => {
+                    if let Some(ov) = plugin_cfg.overrides.get(&metadata.name)
+                        && !ov.enabled
+                    {
+                        info!(
+                            "Skipping plugin '{}' (disabled by plugins.overrides.{})",
+                            metadata.name, metadata.name
+                        );
+                        continue;
+                    }
+                    initialized.push((plugin, metadata));
+                }
+                Err(e) => {
+                    error!("Failed to load plugin '{}': {}", path.display(), e);
+                }
+            }
+        }
+
+        let (ordered, skipped) = sort_plugins_by_dependencies(initialized);
+        for (name, reason) in skipped {
+            error!("Skipping plugin '{name}': {reason}");
+        }
+
+        let mut count = 0;
+        let mut loaded_names: HashSet<String> = HashSet::new();
+        for (plugin, metadata) in ordered {
+            if let Some(failed_dep) = metadata
+                .dependencies
+                .iter()
+                .find(|dep| !loaded_names.contains(*dep))
+            {
+                error!(
+                    "Skipping plugin '{}' because dependency '{}' failed to initialize",
+                    metadata.name, failed_dep
+                );
+                continue;
+            }
+
+            let data_folder = self
+                .plugins_dir
+                .join("data")
+                .join(sanitize_plugin_dir_name(&metadata.name));
+            let context = Arc::new(PluginContext::new(metadata.clone(), data_folder));
+
+            match plugin.on_load(context).await {
+                Ok(()) => {
+                    let language = plugin
+                        .binding_language
+                        .clone()
+                        .unwrap_or_else(|| "wasm".to_string());
+                    info!(
+                        "Loaded plugin '{}' v{} [{}] by {}",
+                        metadata.name,
+                        metadata.version,
+                        language,
+                        if metadata.authors.is_empty() {
+                            "unknown".to_string()
+                        } else {
+                            metadata.authors.join(", ")
                         }
+                    );
+                    loaded_names.insert(metadata.name.clone());
+                    if let Ok(mut meta_guard) = self.loaded_metadata.write() {
+                        meta_guard.push((metadata, language));
                     }
-                    Err(e) => {
-                        error!("Failed to load plugin '{}': {}", path.display(), e);
-                    }
+                    self.loaded_plugins.write().await.push(plugin);
+                    count += 1;
+                }
+                Err(e) => {
+                    error!("Plugin '{}' failed in on_load: {}", metadata.name, e);
                 }
             }
         }
@@ -189,18 +375,26 @@ impl PluginManager {
     }
 
     pub async fn unload_plugins(&self) {
-        let plugins = {
+        let mut plugins = {
             let mut lock = self.loaded_plugins.write().await;
             std::mem::take(&mut *lock)
         };
         if let Ok(mut meta_guard) = self.loaded_metadata.write() {
             meta_guard.clear();
         }
+        self.event_handlers.write().await.clear();
 
+        if let Some(proxy) = self.proxy_ctx.get() {
+            proxy.command_dispatcher.reset_to_builtins();
+        }
+
+        // Unload in reverse topological order so dependents shut down before dependencies.
+        plugins.reverse();
         for plugin in plugins {
-            let data_folder = PathBuf::from("plugins")
+            let data_folder = self
+                .plugins_dir
                 .join("data")
-                .join(&plugin.metadata.name);
+                .join(sanitize_plugin_dir_name(&plugin.metadata.name));
             let context = Arc::new(PluginContext::new(plugin.metadata.clone(), data_folder));
             if let Err(e) = plugin.on_unload(context).await {
                 error!("Error unloading plugin '{}': {}", plugin.metadata.name, e);
@@ -208,8 +402,33 @@ impl PluginManager {
                 info!("Unloaded plugin '{}'", plugin.metadata.name);
             }
         }
+    }
 
-        self.event_handlers.write().await.clear();
+    /// Unloads all currently active plugins and reloads `.wasm` components from disk.
+    pub async fn reload_plugins(&self) -> Result<usize, Box<dyn std::error::Error>> {
+        self.unload_plugins().await;
+        self.load_plugins().await
+    }
+
+    /// Routes a binary IPC message from `sender` to `target` plugin.
+    pub async fn send_ipc_message(
+        &self,
+        sender: &str,
+        target: &str,
+        message: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let target_plugin = {
+            let plugins = self.loaded_plugins.read().await;
+            plugins.iter().find(|p| p.metadata.name == target).cloned()
+        };
+        let Some(plugin) = target_plugin else {
+            return Err(format!("target plugin '{target}' is not loaded"));
+        };
+
+        plugin
+            .handle_ipc_message(sender.to_string(), message.to_vec())
+            .await
+            .map_err(|e| format!("IPC call into '{target}' trapped: {e}"))?
     }
 
     /// Synchronously returns metadata for all currently loaded plugins.
@@ -217,11 +436,20 @@ impl PluginManager {
     pub fn list_plugins(&self) -> Vec<PluginMetadata> {
         self.loaded_metadata
             .read()
+            .map(|guard| guard.iter().map(|(m, _)| m.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Synchronously returns `(PluginMetadata, language)` pairs for all loaded plugins.
+    #[must_use]
+    pub fn list_plugins_with_language(&self) -> Vec<(PluginMetadata, String)> {
+        self.loaded_metadata
+            .read()
             .map(|guard| guard.clone())
             .unwrap_or_default()
     }
 
-    /// Returns telemetry metadata for all currently loaded plugins.
+    /// Returns telemetry metadata (including detected guest binding language) for loaded plugins.
     pub async fn active_plugins_telemetry(&self) -> Vec<crate::telemetry::PluginInfo> {
         let plugins = self.loaded_plugins.read().await;
         plugins
@@ -229,7 +457,11 @@ impl PluginManager {
             .map(|p| crate::telemetry::PluginInfo {
                 name: p.metadata.name.clone(),
                 version: p.metadata.version.clone(),
-                language: Some("wasm".to_string()),
+                language: Some(
+                    p.binding_language
+                        .clone()
+                        .unwrap_or_else(|| "wasm".to_string()),
+                ),
             })
             .collect()
     }
@@ -589,6 +821,33 @@ impl PluginManager {
     }
 }
 
+fn build_wit_command_sender(
+    source: &ProxyCommandSource,
+) -> loader::wasm::wasm_host::wit::vine::plugin::types::CommandSender {
+    match &source.sender {
+        CommandSender::Console => {
+            loader::wasm::wasm_host::wit::vine::plugin::types::CommandSender {
+                sender_type:
+                    loader::wasm::wasm_host::wit::vine::plugin::types::CommandSenderType::Console,
+                name: "CONSOLE".to_string(),
+                player_uuid: None,
+            }
+        }
+        CommandSender::Player { username, .. } => {
+            let uuid = source
+                .session_manager
+                .get_session(username)
+                .map(|s| s.uuid.to_string());
+            loader::wasm::wasm_host::wit::vine::plugin::types::CommandSender {
+                sender_type:
+                    loader::wasm::wasm_host::wit::vine::plugin::types::CommandSenderType::Player,
+                name: username.clone(),
+                player_uuid: uuid,
+            }
+        }
+    }
+}
+
 struct PluginCommandExecutor {
     command_id: u32,
     plugin: Arc<WasmPlugin>,
@@ -602,33 +861,12 @@ impl pumpkin_command::node::CommandExecutor<ProxyCommandSource> for PluginComman
         let args: Vec<String> = if let Ok(phrase) =
             pumpkin_command::argument_types::core::string::StringArgumentType::get(context, "args")
         {
-            phrase.split_whitespace().map(|s| s.to_string()).collect()
+            phrase.split_whitespace().map(str::to_string).collect()
         } else {
             Vec::new()
         };
 
-        let sender = match &context.source.sender {
-            CommandSender::Console => loader::wasm::wasm_host::wit::vine::plugin::types::CommandSender {
-                sender_type:
-                    loader::wasm::wasm_host::wit::vine::plugin::types::CommandSenderType::Console,
-                name: "CONSOLE".to_string(),
-                player_uuid: None,
-            },
-            CommandSender::Player { username, .. } => {
-                let uuid = context
-                    .source
-                    .session_manager
-                    .get_session(username)
-                    .map(|s| s.uuid.to_string());
-                loader::wasm::wasm_host::wit::vine::plugin::types::CommandSender {
-                    sender_type:
-                        loader::wasm::wasm_host::wit::vine::plugin::types::CommandSenderType::Player,
-                    name: username.clone(),
-                    player_uuid: uuid,
-                }
-            }
-        };
-
+        let sender = build_wit_command_sender(&context.source);
         let plugin = self.plugin.clone();
         let command_id = self.command_id;
         let handle = tokio::runtime::Handle::current();
@@ -674,33 +912,12 @@ impl pumpkin_command::suggestion::provider::SuggestionProvider<ProxyCommandSourc
         let args: Vec<String> = if let Ok(phrase) =
             pumpkin_command::argument_types::core::string::StringArgumentType::get(context, "args")
         {
-            phrase.split_whitespace().map(|s| s.to_string()).collect()
+            phrase.split_whitespace().map(str::to_string).collect()
         } else {
             Vec::new()
         };
 
-        let sender = match &context.source.sender {
-            CommandSender::Console => loader::wasm::wasm_host::wit::vine::plugin::types::CommandSender {
-                sender_type:
-                    loader::wasm::wasm_host::wit::vine::plugin::types::CommandSenderType::Console,
-                name: "CONSOLE".to_string(),
-                player_uuid: None,
-            },
-            CommandSender::Player { username, .. } => {
-                let uuid = context
-                    .source
-                    .session_manager
-                    .get_session(username)
-                    .map(|s| s.uuid.to_string());
-                loader::wasm::wasm_host::wit::vine::plugin::types::CommandSender {
-                    sender_type:
-                        loader::wasm::wasm_host::wit::vine::plugin::types::CommandSenderType::Player,
-                    name: username.clone(),
-                    player_uuid: uuid,
-                }
-            }
-        };
-
+        let sender = build_wit_command_sender(&context.source);
         let plugin = self.plugin.clone();
         let command_id = self.command_id;
         let handle = tokio::runtime::Handle::current();
@@ -728,17 +945,55 @@ mod tests {
     use crate::command::CommandDispatcher;
     use crate::config::Config;
     use crate::session::SessionManager;
-    use std::sync::Arc;
+
+    fn make_meta(name: &str, deps: &[&str]) -> PluginMetadata {
+        PluginMetadata {
+            name: name.to_string(),
+            version: "0.1.0".to_string(),
+            authors: vec!["Tester".to_string()],
+            description: None,
+            dependencies: deps.iter().map(|d| (*d).to_string()).collect(),
+            permissions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_sanitize_plugin_dir_name_blocks_traversal() {
+        assert_eq!(sanitize_plugin_dir_name("../../etc/passwd"), "etc_passwd");
+        assert_eq!(sanitize_plugin_dir_name("my-cool_plugin"), "my-cool_plugin");
+        assert_eq!(sanitize_plugin_dir_name("..."), "unnamed_plugin");
+    }
+
+    #[test]
+    fn test_dependency_topological_sort_and_error_filtering() {
+        let candidates = vec![
+            (1, make_meta("chat-filter", &["auth-core", "perms"])),
+            (2, make_meta("perms", &["auth-core"])),
+            (3, make_meta("auth-core", &[])),
+            (4, make_meta("broken", &["non-existent"])),
+            (5, make_meta("cycle-a", &["cycle-b"])),
+            (6, make_meta("cycle-b", &["cycle-a"])),
+        ];
+
+        let (ordered, skipped) = sort_plugins_by_dependencies(candidates);
+        let ordered_names: Vec<&str> = ordered.iter().map(|(_, m)| m.name.as_str()).collect();
+        assert_eq!(ordered_names, vec!["auth-core", "perms", "chat-filter"]);
+
+        let skipped_names: Vec<&str> = skipped.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(skipped_names.contains(&"broken"));
+        assert!(skipped_names.contains(&"cycle-a"));
+        assert!(skipped_names.contains(&"cycle-b"));
+    }
 
     #[tokio::test]
     async fn test_plugin_manager_empty_dir() {
         let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
-        let config = Arc::new(Config::default());
+        let active_config = Arc::new(SyncRwLock::new(Arc::new(Config::default())));
         let dispatcher = Arc::new(CommandDispatcher::new());
         let session_manager = Arc::new(SessionManager::new());
         let manager =
             PluginManager::new(temp_dir.path().to_path_buf()).expect("failed to create manager");
-        manager.init_proxy_context(config, session_manager, dispatcher);
+        manager.init_proxy_context(active_config, session_manager, dispatcher);
 
         let count = manager.load_plugins().await.expect("load failed");
         assert_eq!(count, 0);
@@ -749,14 +1004,13 @@ mod tests {
     #[tokio::test]
     async fn test_plugin_manager_event_dispatch() {
         let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
-        let config = Arc::new(Config::default());
+        let active_config = Arc::new(SyncRwLock::new(Arc::new(Config::default())));
         let dispatcher = Arc::new(CommandDispatcher::new());
         let session_manager = Arc::new(SessionManager::new());
         let manager =
             PluginManager::new(temp_dir.path().to_path_buf()).expect("failed to create manager");
-        manager.init_proxy_context(config, session_manager, dispatcher);
+        manager.init_proxy_context(active_config, session_manager, dispatcher);
 
-        // Proxy ping
         let mut ping = ProxyPingEvent {
             client_ip: "127.0.0.1".to_string(),
             protocol_version: 765,
@@ -770,7 +1024,6 @@ mod tests {
         assert_eq!(ping.motd, "A Minecraft Proxy");
         assert_eq!(ping.max_players, 100);
 
-        // Player pre-login
         let mut pre_login = PlayerPreLoginEvent {
             client_ip: "127.0.0.1".to_string(),
             username: "Player1".to_string(),
@@ -782,7 +1035,6 @@ mod tests {
         manager.fire_player_pre_login(&mut pre_login).await;
         assert!(!pre_login.cancelled);
 
-        // Player login
         let mut login = PlayerLoginEvent {
             uuid: "00000000-0000-0000-0000-000000000001".to_string(),
             username: "Player1".to_string(),
@@ -793,7 +1045,6 @@ mod tests {
         manager.fire_player_login(&mut login).await;
         assert!(!login.cancelled);
 
-        // Server connect
         let mut connect = ServerConnectEvent {
             uuid: "00000000-0000-0000-0000-000000000001".to_string(),
             username: "Player1".to_string(),
@@ -806,7 +1057,6 @@ mod tests {
         assert_eq!(connect.target_server, "lobby");
         assert!(!connect.cancelled);
 
-        // Server connected
         let connected = ServerConnectedEvent {
             uuid: "00000000-0000-0000-0000-000000000001".to_string(),
             username: "Player1".to_string(),
@@ -814,7 +1064,6 @@ mod tests {
         };
         manager.fire_server_connected(&connected).await;
 
-        // Player join
         let join = PlayerJoinEvent {
             uuid: "00000000-0000-0000-0000-000000000001".to_string(),
             username: "Player1".to_string(),
@@ -823,7 +1072,6 @@ mod tests {
         };
         manager.fire_player_join(&join).await;
 
-        // Player chat
         let mut chat = PlayerChatEvent {
             uuid: "00000000-0000-0000-0000-000000000001".to_string(),
             username: "Player1".to_string(),
@@ -834,7 +1082,6 @@ mod tests {
         assert_eq!(chat.message, "Hello proxy!");
         assert!(!chat.cancelled);
 
-        // Player command
         let mut cmd = PlayerCommandEvent {
             uuid: "00000000-0000-0000-0000-000000000001".to_string(),
             username: "Player1".to_string(),
@@ -844,7 +1091,6 @@ mod tests {
         manager.fire_player_command(&mut cmd).await;
         assert!(!cmd.cancelled);
 
-        // Plugin message
         let mut msg = PluginMessageEvent {
             channel: "vine:test".to_string(),
             data: vec![1, 2, 3],
@@ -855,7 +1101,6 @@ mod tests {
         manager.fire_plugin_message(&mut msg).await;
         assert!(!msg.cancelled);
 
-        // Player disconnect
         let disc = PlayerDisconnectEvent {
             uuid: "00000000-0000-0000-0000-000000000001".to_string(),
             username: "Player1".to_string(),
@@ -881,6 +1126,7 @@ mod tests {
             authors: vec!["Author1".to_string()],
             description: Some("A test plugin".to_string()),
             dependencies: vec!["other-plugin".to_string()],
+            permissions: vec![permissions::FS_READ_DATA.to_string()],
         };
 
         let json = serde_json::to_string(&meta).expect("serialization failed");
@@ -889,5 +1135,6 @@ mod tests {
         assert_eq!(decoded.version, "1.0.0");
         assert_eq!(decoded.authors, vec!["Author1".to_string()]);
         assert_eq!(decoded.dependencies, vec!["other-plugin".to_string()]);
+        assert_eq!(decoded.permissions, vec![permissions::FS_READ_DATA]);
     }
 }
