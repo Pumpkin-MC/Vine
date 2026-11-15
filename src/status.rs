@@ -1,8 +1,8 @@
 pub mod icon;
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 
 use pumpkin_protocol::java::client::status::{CPingResponse, CStatusResponse};
 use pumpkin_util::version::JavaMinecraftVersion;
@@ -47,12 +47,16 @@ struct StatusDescription {
     text: String,
 }
 
-pub struct StatusHandler {
+struct StatusState {
     motd: MotdConfig,
-    online_players: Arc<AtomicUsize>,
     icon_manager: Arc<StatusIconManager>,
     servers: HashMap<String, BackendConfig>,
     forced_hosts: HashMap<String, String>,
+}
+
+pub struct StatusHandler {
+    state: RwLock<StatusState>,
+    online_players: Arc<AtomicUsize>,
 }
 
 impl StatusHandler {
@@ -64,11 +68,29 @@ impl StatusHandler {
         forced_hosts: HashMap<String, String>,
     ) -> Self {
         Self {
-            motd,
+            state: RwLock::new(StatusState {
+                motd,
+                icon_manager,
+                servers,
+                forced_hosts,
+            }),
             online_players,
-            icon_manager,
-            servers,
-            forced_hosts,
+        }
+    }
+
+    /// Updates MOTD, favicons, and virtual host mappings at runtime (used by `/vine reload`).
+    pub fn reload(
+        &self,
+        motd: MotdConfig,
+        icon_manager: Arc<StatusIconManager>,
+        servers: HashMap<String, BackendConfig>,
+        forced_hosts: HashMap<String, String>,
+    ) {
+        if let Ok(mut guard) = self.state.write() {
+            guard.motd = motd;
+            guard.icon_manager = icon_manager;
+            guard.servers = servers;
+            guard.forced_hosts = forced_hosts;
         }
     }
 
@@ -78,20 +100,24 @@ impl StatusHandler {
         client_version: JavaMinecraftVersion,
         virtual_host: Option<&str>,
     ) -> String {
+        let Ok(state) = self.state.read() else {
+            return "{}".to_string();
+        };
         let online = self.online_players.load(Ordering::Relaxed);
 
-        let motd_text = self.resolve_motd_text(virtual_host);
+        let motd_text = Self::resolve_motd_text_from_state(&state, virtual_host);
 
-        let icon_uri = self.icon_manager.get_icon_for_host(virtual_host);
+        let icon_uri = state.icon_manager.get_icon_for_host(virtual_host);
 
         let protocol = if client_version == JavaMinecraftVersion::Unknown {
-            self.motd.protocol_version
+            state.motd.protocol_version
         } else {
             client_version.protocol_version()
         };
 
-        let sample: Vec<PlayerSample> = if self.motd.show_sample_players {
-            self.motd
+        let sample: Vec<PlayerSample> = if state.motd.show_sample_players {
+            state
+                .motd
                 .sample_players
                 .iter()
                 .map(|name| PlayerSample {
@@ -105,11 +131,11 @@ impl StatusHandler {
 
         let status = StatusJson {
             version: StatusVersion {
-                name: &self.motd.version_name,
+                name: &state.motd.version_name,
                 protocol,
             },
             players: StatusPlayers {
-                max: self.motd.max_players,
+                max: state.motd.max_players,
                 online,
                 sample,
             },
@@ -123,15 +149,22 @@ impl StatusHandler {
 
     /// Resolves MOTD description for the virtual host or falls back to global default
     pub fn resolve_motd_text(&self, host: Option<&str>) -> String {
+        let Ok(state) = self.state.read() else {
+            return String::new();
+        };
+        Self::resolve_motd_text_from_state(&state, host)
+    }
+
+    fn resolve_motd_text_from_state(state: &StatusState, host: Option<&str>) -> String {
         if let Some(h) = host {
             let clean_host = h.split(':').next().unwrap_or(h).trim();
 
-            let target_server: Option<&str> = self
+            let target_server: Option<&str> = state
                 .forced_hosts
                 .get(clean_host)
                 .map(|s| s.as_str())
                 .or_else(|| {
-                    if self.servers.contains_key(clean_host) {
+                    if state.servers.contains_key(clean_host) {
                         Some(clean_host)
                     } else {
                         None
@@ -139,16 +172,16 @@ impl StatusHandler {
                 });
 
             if let Some(server_name) = target_server
-                && let Some(cfg) = self.servers.get(server_name)
+                && let Some(cfg) = state.servers.get(server_name)
                 && (cfg.motd_line1.is_some() || cfg.motd_line2.is_some())
             {
-                let l1 = cfg.motd_line1.as_deref().unwrap_or(&self.motd.line1);
-                let l2 = cfg.motd_line2.as_deref().unwrap_or(&self.motd.line2);
+                let l1 = cfg.motd_line1.as_deref().unwrap_or(&state.motd.line1);
+                let l2 = cfg.motd_line2.as_deref().unwrap_or(&state.motd.line2);
                 return format!("{}\n{}", l1, l2);
             }
         }
 
-        format!("{}\n{}", self.motd.line1, self.motd.line2)
+        format!("{}\n{}", state.motd.line1, state.motd.line2)
     }
 
     /// Create CStatusResponse packet
@@ -171,16 +204,20 @@ impl StatusHandler {
         version_name: &str,
         virtual_host: Option<&str>,
     ) -> CStatusResponse {
+        let Ok(state) = self.state.read() else {
+            return CStatusResponse::new("{}".to_string());
+        };
         let protocol = if client_version == JavaMinecraftVersion::Unknown {
-            self.motd.protocol_version
+            state.motd.protocol_version
         } else {
             client_version.protocol_version()
         };
 
-        let icon_uri = self.icon_manager.get_icon_for_host(virtual_host);
+        let icon_uri = state.icon_manager.get_icon_for_host(virtual_host);
 
-        let sample: Vec<PlayerSample> = if self.motd.show_sample_players {
-            self.motd
+        let sample: Vec<PlayerSample> = if state.motd.show_sample_players {
+            state
+                .motd
                 .sample_players
                 .iter()
                 .map(|name| PlayerSample {

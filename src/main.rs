@@ -33,20 +33,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let server = ProxyServer::new(config)?;
+    let server = ProxyServer::with_config_path(config, config_path)?;
 
-    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+    let (shutdown_tx, shutdown_rx) = broadcast::channel(4);
+    let signal_shutdown_tx = shutdown_tx.clone();
 
     tokio::spawn(async move {
         if let Err(err) = tokio::signal::ctrl_c().await {
             error!("Failed to listen for shutdown signal: {}", err);
         } else {
             info!("Received shutdown signal (Ctrl+C). Initiating graceful shutdown...");
-            let _ = shutdown_tx.send(());
+            let _ = signal_shutdown_tx.send(());
         }
     });
 
-    if let Err(e) = server.run(shutdown_rx).await {
+    if let Err(e) = server.run_with_shutdown(shutdown_tx, shutdown_rx).await {
         error!("Fatal proxy error: {}", e);
         std::process::exit(1);
     }

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use tokio::sync::broadcast;
@@ -18,7 +19,7 @@ use crate::status::{StatusHandler, StatusIconManager};
 use crate::telemetry;
 
 pub struct ProxyServer {
-    config: Arc<Config>,
+    active_config: Arc<RwLock<Arc<Config>>>,
     keystore: Arc<KeyStore>,
     authenticator: Arc<Authenticator>,
     rate_limiter: Arc<ConnectionRateLimiter>,
@@ -30,9 +31,39 @@ pub struct ProxyServer {
     plugin_manager: Arc<crate::plugin::PluginManager>,
 }
 
+fn build_icon_manager(config: &Config) -> Arc<StatusIconManager> {
+    let server_icons: HashMap<String, String> = config
+        .servers
+        .iter()
+        .filter_map(|(name, s)| s.icon_path.as_ref().map(|p| (name.clone(), p.clone())))
+        .collect();
+
+    Arc::new(StatusIconManager::new(
+        config.motd.icon_path.clone(),
+        server_icons,
+        config.routing.forced_hosts.clone(),
+        config.routing.default_server.clone(),
+    ))
+}
+
 impl ProxyServer {
     pub fn new(config: Config) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_inner(config, None)
+    }
+
+    pub fn with_config_path(
+        config: Config,
+        config_path: PathBuf,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_inner(config, Some(config_path))
+    }
+
+    fn new_inner(
+        config: Config,
+        config_path: Option<PathBuf>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let config = Arc::new(config);
+        let active_config = Arc::new(RwLock::new(config.clone()));
         let keystore = Arc::new(KeyStore::new()?);
         let authenticator = Arc::new(Authenticator::new());
 
@@ -46,18 +77,7 @@ impl ProxyServer {
         let session_manager = Arc::new(SessionManager::new());
         let command_dispatcher = Arc::new(CommandDispatcher::new());
 
-        let server_icons: HashMap<String, String> = config
-            .servers
-            .iter()
-            .filter_map(|(name, s)| s.icon_path.as_ref().map(|p| (name.clone(), p.clone())))
-            .collect();
-
-        let icon_manager = Arc::new(StatusIconManager::new(
-            config.motd.icon_path.clone(),
-            server_icons,
-            config.routing.forced_hosts.clone(),
-            config.routing.default_server.clone(),
-        ));
+        let icon_manager = build_icon_manager(&config);
 
         let status_handler = Arc::new(StatusHandler::new(
             config.motd.clone(),
@@ -69,7 +89,7 @@ impl ProxyServer {
 
         let router = Arc::new(Router::new(config.routing.clone(), config.servers.clone()));
 
-        let plugins_dir = std::path::PathBuf::from(&config.plugins.plugin_dir);
+        let plugins_dir = PathBuf::from(&config.plugins.plugin_dir);
         let plugin_manager = crate::plugin::PluginManager::new(plugins_dir)?;
         plugin_manager.init_proxy_context(
             config.clone(),
@@ -77,8 +97,50 @@ impl ProxyServer {
             command_dispatcher.clone(),
         );
 
+        command_dispatcher
+            .runtime()
+            .set_plugin_manager(&plugin_manager);
+
+        let reload_path = config_path.unwrap_or_else(|| PathBuf::from("vine.toml"));
+        let reload_active_cfg = active_config.clone();
+        let reload_router = router.clone();
+        let reload_status = status_handler.clone();
+        let reload_rate_limiter = rate_limiter.clone();
+        command_dispatcher
+            .runtime()
+            .set_reload_handler(Arc::new(move || {
+                let content = std::fs::read_to_string(&reload_path)
+                    .map_err(|e| format!("could not read '{}': {e}", reload_path.display()))?;
+                let parsed: Config = toml::from_str(&content)
+                    .map_err(|e| format!("invalid TOML in '{}': {e}", reload_path.display()))?;
+                let new_cfg = Arc::new(parsed);
+
+                let new_icons = build_icon_manager(&new_cfg);
+                reload_router.reload(new_cfg.routing.clone(), new_cfg.servers.clone());
+                reload_status.reload(
+                    new_cfg.motd.clone(),
+                    new_icons,
+                    new_cfg.servers.clone(),
+                    new_cfg.routing.forced_hosts.clone(),
+                );
+                reload_rate_limiter.reload(
+                    new_cfg.security.rate_limit_enabled,
+                    new_cfg.security.max_connections_per_sec,
+                    new_cfg.security.connection_burst,
+                );
+                if let Ok(mut guard) = reload_active_cfg.write() {
+                    *guard = new_cfg.clone();
+                }
+                info!(
+                    "Reloaded configuration from '{}' ({} backend server(s))",
+                    reload_path.display(),
+                    new_cfg.servers.len()
+                );
+                Ok(new_cfg)
+            }));
+
         Ok(Self {
-            config,
+            active_config,
             keystore,
             authenticator,
             rate_limiter,
@@ -91,78 +153,107 @@ impl ProxyServer {
         })
     }
 
+    fn current_config(&self) -> Arc<Config> {
+        self.active_config
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// Run the proxy listener loop
     pub async fn run(
         &self,
+        shutdown_rx: broadcast::Receiver<()>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (internal_shutdown_tx, _) = broadcast::channel(1);
+        self.run_with_shutdown(internal_shutdown_tx, shutdown_rx)
+            .await
+    }
+
+    /// Run the proxy listener loop with an attached shutdown sender so `/end` and `/stop`
+    /// can trigger graceful shutdown.
+    pub async fn run_with_shutdown(
+        &self,
+        shutdown_tx: broadcast::Sender<()>,
         mut shutdown_rx: broadcast::Receiver<()>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let bind_addr = &self.config.server.bind_address;
-        let listener = network::create_tcp_listener(bind_addr, &self.config.network)?;
+        self.command_dispatcher
+            .runtime()
+            .set_shutdown_sender(shutdown_tx.clone());
+        let mut command_shutdown_rx = shutdown_tx.subscribe();
+
+        let startup_config = self.current_config();
+        let bind_addr = &startup_config.server.bind_address;
+        let listener = network::create_tcp_listener(bind_addr, &startup_config.network)?;
 
         info!("=====================================================");
         info!("  Vine Minecraft Proxy is listening on {}", bind_addr);
-        info!("  Online mode: {}", self.config.server.online_mode);
+        info!("  Online mode: {}", startup_config.server.online_mode);
         info!("  Multi-version support: 1.7.2 through 1.21.x / 26.x");
         info!("  Networking options:");
-        info!("    - TCP_NODELAY: {}", self.config.network.tcp_nodelay);
+        info!("    - TCP_NODELAY: {}", startup_config.network.tcp_nodelay);
         info!(
             "    - TCP KeepAlive: {}s",
-            self.config.network.tcp_keepalive_secs
+            startup_config.network.tcp_keepalive_secs
         );
         info!(
             "    - PROXY Protocol v1/v2: {}",
-            self.config.network.proxy_protocol
+            startup_config.network.proxy_protocol
         );
         info!(
             "    - Handshake timeout: {}s",
-            self.config.network.client_handshake_timeout_secs
+            startup_config.network.client_handshake_timeout_secs
         );
         info!(
             "    - Login timeout: {}s",
-            self.config.network.client_login_timeout_secs
+            startup_config.network.client_login_timeout_secs
         );
         info!(
             "    - Backend connect timeout: {}s",
-            self.config.network.backend_connect_timeout_secs
+            startup_config.network.backend_connect_timeout_secs
         );
         info!(
             "    - Compression level: {} (threshold: {} bytes)",
-            self.config.server.compression_level, self.config.server.compression_threshold
+            startup_config.server.compression_level, startup_config.server.compression_threshold
         );
         info!(
             "  Configured backend servers: {}",
-            self.config.servers.len()
+            startup_config.servers.len()
         );
-        for (name, server) in &self.config.servers {
+        for (name, server) in &startup_config.servers {
             let icon_info = server.icon_path.as_deref().unwrap_or("none");
             info!(
                 "    - [{}] {} (Forwarding: {:?}, Icon: {})",
                 name, server.address, server.forwarding, icon_info
             );
         }
-        info!("  Default route: '{}'", self.config.routing.default_server);
-        if self.config.telemetry.enabled {
+        info!(
+            "  Default route: '{}'",
+            startup_config.routing.default_server
+        );
+        if startup_config.telemetry.enabled {
             info!(
                 "  Telemetry: enabled (endpoint: {}, interval: {}s)",
-                self.config.telemetry.endpoint, self.config.telemetry.interval_secs
+                startup_config.telemetry.endpoint, startup_config.telemetry.interval_secs
             );
         } else {
             info!("  Telemetry: disabled");
         }
-        if self.config.bedrock.enabled {
+        if startup_config.bedrock.enabled {
             info!(
-                "  Bedrock Edition: enabled (listening on UDP {}, v{} / proto {})",
-                self.config.bedrock.bind_address,
-                self.config.bedrock.version_name,
-                self.config.bedrock.protocol_version
+                "  Bedrock Edition (NetherNet): enabled (TCP/UDP {}, LAN discovery: {}, v{} / proto {})",
+                startup_config.bedrock.bind_address,
+                startup_config.bedrock.lan_discovery,
+                startup_config.bedrock.version_name,
+                startup_config.bedrock.protocol_version
             );
         } else {
-            info!("  Bedrock Edition: disabled");
+            info!("  Bedrock Edition (NetherNet): disabled");
         }
         info!("=====================================================");
 
-        if self.config.bedrock.enabled {
-            let bedrock_cfg = self.config.bedrock.clone();
+        if startup_config.bedrock.enabled {
+            let bedrock_cfg = startup_config.bedrock.clone();
             let online_players = self.online_players.clone();
             let bedrock_shutdown = shutdown_rx.resubscribe();
 
@@ -174,13 +265,13 @@ impl ProxyServer {
                 )
                 .await
                 {
-                    error!("Bedrock listener terminated with error: {}", e);
+                    error!("Bedrock NetherNet listener terminated with error: {}", e);
                 }
             });
         }
 
         let console_dispatcher = self.command_dispatcher.clone();
-        let console_config = self.config.clone();
+        let console_active_config = self.active_config.clone();
         let console_session_manager = self.session_manager.clone();
         let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -210,9 +301,13 @@ impl ProxyServer {
                         match cmd_opt {
                             Some(trimmed) => {
                                 if !trimmed.is_empty() {
+                                    let cfg = console_active_config
+                                        .read()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .clone();
                                     let source = ProxyCommandSource {
                                         sender: CommandSender::Console,
-                                        config: console_config.clone(),
+                                        config: cfg,
                                         session_manager: console_session_manager.clone(),
                                     };
                                     console_dispatcher.handle_command(&source, &trimmed);
@@ -225,10 +320,10 @@ impl ProxyServer {
             }
         });
 
-        if self.config.plugins.enabled {
+        if startup_config.plugins.enabled {
             info!(
                 "Loading plugins from '{}'...",
-                self.config.plugins.plugin_dir
+                startup_config.plugins.plugin_dir
             );
             if let Err(e) = self.plugin_manager.load_plugins().await {
                 error!("Failed to load plugins: {}", e);
@@ -236,7 +331,7 @@ impl ProxyServer {
         }
 
         let telemetry_handle = telemetry::start_telemetry(
-            self.config.clone(),
+            startup_config.clone(),
             self.online_players.clone(),
             self.session_manager.clone(),
             self.plugin_manager.clone(),
@@ -248,7 +343,7 @@ impl ProxyServer {
                 accept_res = listener.accept() => {
                     match accept_res {
                         Ok((stream, peer_addr)) => {
-                            let config = self.config.clone();
+                            let config = self.current_config();
                             let keystore = self.keystore.clone();
                             let authenticator = self.authenticator.clone();
                             let status_handler = self.status_handler.clone();
@@ -315,18 +410,23 @@ impl ProxyServer {
                     info!("Shutting down Vine proxy listener...");
                     break;
                 }
+                _ = command_shutdown_rx.recv() => {
+                    let _ = shutdown_tx.send(());
+                    info!("Shutting down Vine proxy listener...");
+                    break;
+                }
             }
         }
 
         info!("Vine proxy has stopped accepting connections.");
 
-        if self.config.plugins.enabled {
+        if startup_config.plugins.enabled {
             info!("Unloading plugins...");
             self.plugin_manager.unload_plugins().await;
         }
 
         if let Some(handle) = telemetry_handle {
-            let timeout_secs = self.config.server.shutdown_timeout_secs.max(1);
+            let timeout_secs = startup_config.server.shutdown_timeout_secs.max(1);
             let _ = tokio::time::timeout(Duration::from_secs(timeout_secs), handle).await;
         }
 

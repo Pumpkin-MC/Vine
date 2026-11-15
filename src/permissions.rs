@@ -94,6 +94,12 @@ fn default_permission_groups() -> HashMap<String, GroupConfig> {
             inherits: vec!["default".to_string()],
             permissions: vec![
                 "vine.command.send".to_string(),
+                "vine.command.alert".to_string(),
+                "vine.command.find".to_string(),
+                "vine.command.kick".to_string(),
+                "vine.command.end".to_string(),
+                "vine.command.vine".to_string(),
+                "vine.command.reload".to_string(),
                 "vine.admin".to_string(),
                 "*".to_string(),
             ],

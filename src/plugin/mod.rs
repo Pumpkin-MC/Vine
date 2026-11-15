@@ -27,6 +27,7 @@ pub struct PluginManager {
     plugins_dir: PathBuf,
     loader: WasmPluginLoader,
     loaded_plugins: RwLock<Vec<Arc<WasmPlugin>>>,
+    loaded_metadata: std::sync::RwLock<Vec<PluginMetadata>>,
     event_handlers: RwLock<HashMap<EventType, Vec<RegisteredEventHandler>>>,
     proxy_ctx: OnceCell<ProxyPluginContext>,
 }
@@ -40,6 +41,7 @@ impl PluginManager {
             plugins_dir,
             loader,
             loaded_plugins: RwLock::new(Vec::new()),
+            loaded_metadata: std::sync::RwLock::new(Vec::new()),
             event_handlers: RwLock::new(HashMap::new()),
             proxy_ctx: OnceCell::new(),
         }))
@@ -164,6 +166,9 @@ impl PluginManager {
                                     metadata.version,
                                     metadata.authors.join(", ")
                                 );
+                                if let Ok(mut meta_guard) = self.loaded_metadata.write() {
+                                    meta_guard.push(metadata);
+                                }
                                 self.loaded_plugins.write().await.push(plugin);
                                 count += 1;
                             }
@@ -188,6 +193,9 @@ impl PluginManager {
             let mut lock = self.loaded_plugins.write().await;
             std::mem::take(&mut *lock)
         };
+        if let Ok(mut meta_guard) = self.loaded_metadata.write() {
+            meta_guard.clear();
+        }
 
         for plugin in plugins {
             let data_folder = PathBuf::from("plugins")
@@ -202,6 +210,15 @@ impl PluginManager {
         }
 
         self.event_handlers.write().await.clear();
+    }
+
+    /// Synchronously returns metadata for all currently loaded plugins.
+    #[must_use]
+    pub fn list_plugins(&self) -> Vec<PluginMetadata> {
+        self.loaded_metadata
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
     }
 
     /// Returns telemetry metadata for all currently loaded plugins.

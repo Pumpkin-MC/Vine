@@ -34,26 +34,45 @@ impl TokenBucket {
     }
 }
 
-pub struct ConnectionRateLimiter {
+struct RateLimiterSettings {
     enabled: bool,
     rate_per_sec: f64,
     burst: f64,
+}
+
+pub struct ConnectionRateLimiter {
+    settings: RwLock<RateLimiterSettings>,
     buckets: RwLock<HashMap<IpAddr, TokenBucket>>,
 }
 
 impl ConnectionRateLimiter {
     pub fn new(enabled: bool, rate_per_sec: u32, burst: u32) -> Self {
         Self {
-            enabled,
-            rate_per_sec: rate_per_sec as f64,
-            burst: burst as f64,
+            settings: RwLock::new(RateLimiterSettings {
+                enabled,
+                rate_per_sec: rate_per_sec as f64,
+                burst: burst as f64,
+            }),
             buckets: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Updates connection rate limiter settings at runtime (used by `/vine reload`).
+    pub fn reload(&self, enabled: bool, rate_per_sec: u32, burst: u32) {
+        if let Ok(mut guard) = self.settings.write() {
+            guard.enabled = enabled;
+            guard.rate_per_sec = rate_per_sec as f64;
+            guard.burst = burst as f64;
         }
     }
 
     /// Returns true if connection is allowed, false if rate limited
     pub fn check_connection(&self, ip: &IpAddr) -> bool {
-        if !self.enabled {
+        let (enabled, rate_per_sec, burst) = match self.settings.read() {
+            Ok(s) => (s.enabled, s.rate_per_sec, s.burst),
+            Err(_) => return true,
+        };
+        if !enabled {
             return true;
         }
 
@@ -69,9 +88,9 @@ impl ConnectionRateLimiter {
 
         let bucket = buckets
             .entry(*ip)
-            .or_insert_with(|| TokenBucket::new(self.burst));
+            .or_insert_with(|| TokenBucket::new(burst));
 
-        bucket.try_consume(self.rate_per_sec, self.burst)
+        bucket.try_consume(rate_per_sec, burst)
     }
 }
 

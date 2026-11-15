@@ -950,13 +950,14 @@ fn inject_proxy_commands(
     let mut extra_nodes_buf = Vec::new();
 
     for (cmd_name, _) in permitted_commands {
-        let takes_args = matches!(*cmd_name, "server" | "send" | "help");
+        let takes_args = *cmd_name != "list";
+        let is_bare_executable = !matches!(*cmd_name, "send" | "alert" | "find" | "kick");
         if takes_args {
             let lit_node = ProtoNode {
                 children: vec![VarInt((next_node_idx + 1) as i32)].into_boxed_slice(),
                 node_type: ProtoNodeType::Literal {
                     name: cmd_name,
-                    is_executable: *cmd_name != "send",
+                    is_executable: is_bare_executable,
                     redirect_target: None,
                     restricted: false,
                 },
