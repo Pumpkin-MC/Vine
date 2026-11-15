@@ -40,11 +40,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let signal_shutdown_tx = shutdown_tx.clone();
 
     tokio::spawn(async move {
-        if let Err(err) = tokio::signal::ctrl_c().await {
-            error!("Failed to listen for shutdown signal: {}", err);
-        } else {
-            info!("Received shutdown signal (Ctrl+C). Initiating graceful shutdown...");
-            let _ = signal_shutdown_tx.send(());
+        match wait_for_shutdown_signal().await {
+            Ok(sig_name) => {
+                info!(
+                    "Received shutdown signal ({}). Initiating graceful shutdown...",
+                    sig_name
+                );
+                let _ = signal_shutdown_tx.send(());
+            }
+            Err(err) => {
+                error!("Failed to listen for shutdown signal: {}", err);
+            }
         }
     });
 
@@ -55,6 +61,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Vine proxy shut down successfully.");
     std::process::exit(0);
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> std::io::Result<&'static str> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut hangup = signal(SignalKind::hangup())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+
+    let sig_name = tokio::select! {
+        _ = interrupt.recv() => "SIGINT",
+        _ = hangup.recv() => "SIGHUP",
+        _ = terminate.recv() => "SIGTERM",
+    };
+
+    Ok(sig_name)
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() -> std::io::Result<&'static str> {
+    tokio::signal::ctrl_c().await?;
+    Ok("Ctrl+C")
 }
 
 fn parse_cli_args(args: impl Iterator<Item = String>) -> (PathBuf, bool) {

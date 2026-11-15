@@ -92,6 +92,7 @@ impl ClientHandler {
         self,
         stream: TcpStream,
         leftover_bytes: Vec<u8>,
+        mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     ) -> Result<(), ClientError> {
         let (read_half, write_half) = stream.into_split();
         let reader = PrefixedRead::new(read_half, leftover_bytes);
@@ -100,10 +101,13 @@ impl ClientHandler {
 
         let handshake_timeout =
             Duration::from_secs(self.config.network.client_handshake_timeout_secs);
-        let raw_handshake = timeout(handshake_timeout, decoder.get_raw_packet())
-            .await
-            .map_err(|_| ClientError::Timeout)?
-            .map_err(|e| ClientError::DecodeError(e.to_string()))?;
+        let raw_handshake = tokio::select! {
+            biased;
+            _ = shutdown_rx.recv() => return Ok(()),
+            res = timeout(handshake_timeout, decoder.get_raw_packet()) => res,
+        }
+        .map_err(|_| ClientError::Timeout)?
+        .map_err(|e| ClientError::DecodeError(e.to_string()))?;
 
         let client_version_guess = JavaMinecraftVersion::V_26_2;
         let mut handshake_bytes = &raw_handshake.payload[..];
@@ -128,8 +132,11 @@ impl ClientHandler {
                         self.peer_addr, client_protocol, client_version, clean_host
                     );
                 }
-                self.handle_status(&mut decoder, &mut encoder, client_version, &clean_host)
-                    .await
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx.recv() => Ok(()),
+                    res = self.handle_status(&mut decoder, &mut encoder, client_version, &clean_host) => res,
+                }
             }
             ConnectionState::Login => {
                 self.handle_login(
@@ -138,6 +145,7 @@ impl ClientHandler {
                     client_version,
                     clean_host,
                     self.peer_addr.ip(),
+                    shutdown_rx,
                 )
                 .await
             }
@@ -226,7 +234,37 @@ impl ClientHandler {
         client_version: JavaMinecraftVersion,
         virtual_host: String,
         client_ip: IpAddr,
+        mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     ) -> Result<(), ClientError> {
+        let maybe_bridge = tokio::select! {
+            biased;
+            _ = shutdown_rx.recv() => {
+                let _ = Self::kick(&mut encoder, client_version, "Proxy is shutting down.").await;
+                return Ok(());
+            }
+            res = self.authenticate_and_prepare_bridge(
+                &mut decoder,
+                &mut encoder,
+                client_version,
+                virtual_host,
+                client_ip,
+            ) => res?,
+        };
+
+        if let Some(bridge) = maybe_bridge {
+            bridge.run(decoder, encoder, shutdown_rx).await?;
+        }
+        Ok(())
+    }
+
+    async fn authenticate_and_prepare_bridge(
+        &self,
+        decoder: &mut TCPNetworkDecoder<PrefixedRead<OwnedReadHalf>>,
+        encoder: &mut TCPNetworkEncoder<OwnedWriteHalf>,
+        client_version: JavaMinecraftVersion,
+        virtual_host: String,
+        client_ip: IpAddr,
+    ) -> Result<Option<BackendBridge>, ClientError> {
         let login_timeout = Duration::from_secs(self.config.network.client_login_timeout_secs);
 
         let raw_login_start = timeout(login_timeout, decoder.get_raw_packet())
@@ -260,8 +298,8 @@ impl ClientHandler {
                 "[{}] Player '{}' pre-login cancelled by plugin: {}",
                 self.peer_addr, username, reason
             );
-            Self::kick(&mut encoder, client_version, reason).await?;
-            return Ok(());
+            Self::kick(encoder, client_version, reason).await?;
+            return Ok(None);
         }
 
         if self.config.security.validate_usernames && !Sanitizer::is_valid_username(&username) {
@@ -270,12 +308,12 @@ impl ClientHandler {
                 self.peer_addr, username
             );
             Self::kick(
-                &mut encoder,
+                encoder,
                 client_version,
                 "Invalid username characters or length (must be 2-16 alphanumeric or _)",
             )
             .await?;
-            return Ok(());
+            return Ok(None);
         }
 
         info!(
@@ -319,12 +357,7 @@ impl ClientHandler {
                     "[{}] Verify token mismatch for '{}'",
                     self.peer_addr, username
                 );
-                Self::kick(
-                    &mut encoder,
-                    client_version,
-                    "Failed to verify encryption token",
-                )
-                .await?;
+                Self::kick(encoder, client_version, "Failed to verify encryption token").await?;
                 return Err(ClientError::AuthError("Token mismatch".to_string()));
             }
 
@@ -339,12 +372,7 @@ impl ClientHandler {
                     self.peer_addr,
                     shared_secret.len()
                 );
-                Self::kick(
-                    &mut encoder,
-                    client_version,
-                    "Invalid encryption key length",
-                )
-                .await?;
+                Self::kick(encoder, client_version, "Invalid encryption key length").await?;
                 return Err(ClientError::AuthError("Invalid key length".to_string()));
             }
 
@@ -370,7 +398,7 @@ impl ClientHandler {
                         self.peer_addr, username, e
                     );
                     Self::kick(
-                        &mut encoder,
+                        encoder,
                         client_version,
                         "Failed to verify username with Mojang session servers! Please try again later.",
                     )
@@ -415,8 +443,8 @@ impl ClientHandler {
                 "[{}] Player '{}' login cancelled by plugin: {}",
                 self.peer_addr, authenticated_player.username, reason
             );
-            Self::kick(&mut encoder, client_version, reason).await?;
-            return Ok(());
+            Self::kick(encoder, client_version, reason).await?;
+            return Ok(None);
         }
 
         let comp_threshold = self.config.server.compression_threshold;
@@ -449,12 +477,12 @@ impl ClientHandler {
                     self.peer_addr, virtual_host
                 );
                 Self::kick(
-                    &mut encoder,
+                    encoder,
                     client_version,
                     "No default or matching backend Minecraft server is configured on the proxy.",
                 )
                 .await?;
-                return Ok(());
+                return Ok(None);
             }
         };
 
@@ -491,8 +519,7 @@ impl ClientHandler {
             self.plugin_manager.clone(),
         );
 
-        bridge.run(decoder, encoder).await?;
-        Ok(())
+        Ok(Some(bridge))
     }
 
     /// Helper to send formatted CLoginDisconnect packet to client

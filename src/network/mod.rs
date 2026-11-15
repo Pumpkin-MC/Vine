@@ -101,3 +101,63 @@ pub fn configure_backend_socket(stream: &TcpStream, config: &NetworkConfig) -> i
 
     Ok(())
 }
+
+/// Raises the soft open file descriptor limit (`RLIMIT_NOFILE`) on Unix systems
+/// so high-concurrency proxying (2+ sockets per player) does not hit `EMFILE`.
+#[cfg(unix)]
+pub fn adjust_file_descriptor_limit() {
+    let mut rlim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+
+    // SAFETY: Passing a valid mutable pointer to a stack-allocated `rlimit` struct.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut rlim) } != 0 {
+        return;
+    }
+
+    let max_target = if rlim.rlim_max == libc::RLIM_INFINITY {
+        1_048_576
+    } else {
+        rlim.rlim_max
+    };
+
+    if rlim.rlim_cur < max_target {
+        let old_limit = rlim.rlim_cur;
+        rlim.rlim_cur = max_target;
+
+        // SAFETY: Calling `setrlimit` with a valid resource and valid pointer to initialized `rlimit`.
+        let res = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const rlim) };
+        if res == 0 {
+            debug!("Increased open file descriptor limit from {old_limit} to {max_target}");
+        } else {
+            // Fallback: try setting to a reasonable high value (65,536) if max_target was rejected by the OS.
+            let fallback = 65_536.min(max_target);
+            if fallback > old_limit {
+                rlim.rlim_cur = fallback;
+                // SAFETY: Calling `setrlimit` with a valid resource and valid pointer to initialized `rlimit`.
+                if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const rlim) } == 0 {
+                    debug!("Increased open file descriptor limit from {old_limit} to {fallback}");
+                }
+            }
+        }
+    }
+
+    let mut current_rlim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: Passing a valid mutable pointer to a stack-allocated `rlimit` struct.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut current_rlim) } == 0
+        && current_rlim.rlim_cur < 4096
+    {
+        warn!(
+            "Open file descriptor limit is low ({}). Each proxied player uses at least 2 sockets, so >1000 concurrent players may fail with 'Too many open files'. \
+            Consider increasing the limit with `ulimit -n 65535` or setting `LimitNOFILE=65535` in systemd.",
+            current_rlim.rlim_cur
+        );
+    }
+}
+
+#[cfg(not(unix))]
+pub fn adjust_file_descriptor_limit() {}

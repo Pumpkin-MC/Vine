@@ -377,6 +377,14 @@ impl Default for TelemetryConfig {
     }
 }
 
+/// Generates a cryptographically random 256-bit (64-hex-character) forwarding secret
+/// suitable for both Velocity HMAC-SHA256 and Vine Ed25519 forwarding.
+#[must_use]
+pub fn generate_forwarding_secret() -> String {
+    let bytes: [u8; 32] = rand::random();
+    hex::encode(bytes)
+}
+
 impl Default for Config {
     fn default() -> Self {
         let mut servers = HashMap::new();
@@ -385,7 +393,7 @@ impl Default for Config {
             BackendConfig {
                 address: "127.0.0.1:25566".to_string(),
                 forwarding: ForwardingMode::Velocity,
-                secret: Some("vine-velocity-secret-change-me".to_string()),
+                secret: Some(generate_forwarding_secret()),
                 public_key: None,
                 icon_path: None,
                 motd_line1: None,
@@ -577,5 +585,24 @@ mod tests {
             hub.environment.get("API_URL").map(String::as_str),
             Some("http://127.0.0.1:8080")
         );
+    }
+
+    #[test]
+    fn test_default_config_generates_random_forwarding_secret() {
+        let cfg1 = Config::default();
+        let cfg2 = Config::default();
+
+        let secret1 = cfg1.servers["lobby"]
+            .secret
+            .as_deref()
+            .expect("lobby secret present");
+        let secret2 = cfg2.servers["lobby"]
+            .secret
+            .as_deref()
+            .expect("lobby secret present");
+
+        assert_eq!(secret1.len(), 64);
+        assert!(hex::decode(secret1).is_ok());
+        assert_ne!(secret1, secret2);
     }
 }

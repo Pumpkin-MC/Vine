@@ -137,6 +137,22 @@ impl SessionManager {
             0
         }
     }
+
+    /// Sends a disconnect action to every active session and returns how many were notified.
+    pub fn disconnect_all(&self, reason: &str) -> usize {
+        let sessions = self.list_sessions();
+        let mut notified = 0;
+        for session in &sessions {
+            if session
+                .action_tx
+                .send(PlayerAction::Disconnect(reason.to_string()))
+                .is_ok()
+            {
+                notified += 1;
+            }
+        }
+        notified
+    }
 }
 
 #[cfg(test)]
@@ -196,6 +212,50 @@ mod tests {
         assert_eq!(
             manager.get_session("Alex").unwrap().current_server,
             "survival"
+        );
+    }
+
+    #[test]
+    fn test_session_disconnect_all() {
+        let manager = SessionManager::new();
+        let (tx1, mut rx1) = mpsc::unbounded_channel();
+        let (tx2, mut rx2) = mpsc::unbounded_channel();
+
+        manager.register(PlayerSession {
+            username: "Steve".to_string(),
+            uuid: Uuid::new_v4(),
+            current_server: "lobby".to_string(),
+            action_tx: tx1,
+            client_ip: "127.0.0.1:1000".to_string(),
+            protocol_version: 776,
+            client_brand: None,
+            locale: None,
+            view_distance: None,
+        });
+        manager.register(PlayerSession {
+            username: "Alex".to_string(),
+            uuid: Uuid::new_v4(),
+            current_server: "survival".to_string(),
+            action_tx: tx2,
+            client_ip: "127.0.0.1:1001".to_string(),
+            protocol_version: 776,
+            client_brand: None,
+            locale: None,
+            view_distance: None,
+        });
+
+        assert_eq!(manager.disconnect_all("Proxy is shutting down."), 2);
+        assert_eq!(
+            rx1.try_recv(),
+            Ok(PlayerAction::Disconnect(
+                "Proxy is shutting down.".to_string()
+            ))
+        );
+        assert_eq!(
+            rx2.try_recv(),
+            Ok(PlayerAction::Disconnect(
+                "Proxy is shutting down.".to_string()
+            ))
         );
     }
 }

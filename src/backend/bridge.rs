@@ -81,6 +81,8 @@ pub enum TunnelExit {
     Connect { server_name: String },
     /// Direct client transfer requested
     Transfer { host: String, port: u16 },
+    /// Proxy-initiated disconnect (kick, `/stop`, `/end`, plugin kick, or proxy shutdown)
+    ProxyDisconnected { reason: String },
     /// Backend server closed connection or sent disconnect/kick
     BackendDisconnected { reason: Option<String> },
 }
@@ -417,6 +419,7 @@ impl BackendBridge {
         self,
         mut client_decoder: TCPNetworkDecoder<R>,
         mut client_encoder: TCPNetworkEncoder<W>,
+        mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     ) -> Result<(), BridgeError>
     where
         R: AsyncRead + Unpin + Send + 'static,
@@ -531,6 +534,16 @@ impl BackendBridge {
             view_distance: None,
         });
 
+        // If shutdown already started while initial backend login was in flight, queue disconnect immediately.
+        if !matches!(
+            shutdown_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ) {
+            let _ = action_tx.send(PlayerAction::Disconnect(
+                "Proxy is shutting down.".to_string(),
+            ));
+        }
+
         let mut client_state = if self.client_version >= JavaMinecraftVersion::V_1_20_2 {
             ConnectionState::Login
         } else {
@@ -589,6 +602,36 @@ impl BackendBridge {
                         "Transferring player '{}' to {}:{}",
                         self.player.username, host, port
                     );
+                    break;
+                }
+                TunnelExit::ProxyDisconnected { reason } => {
+                    info!(
+                        "Disconnecting player '{}' from proxy: {}",
+                        self.player.username, reason
+                    );
+                    match client_state {
+                        ConnectionState::Play => {
+                            Self::disconnect_client(
+                                &mut client_encoder,
+                                self.client_version,
+                                false,
+                                &reason,
+                            )
+                            .await;
+                        }
+                        ConnectionState::Config => {
+                            Self::disconnect_client(
+                                &mut client_encoder,
+                                self.client_version,
+                                true,
+                                &reason,
+                            )
+                            .await;
+                        }
+                        _ => {
+                            let _ = client_encoder.flush().await;
+                        }
+                    }
                     break;
                 }
                 TunnelExit::Connect { server_name } => {
@@ -1520,14 +1563,7 @@ impl BackendBridge {
                         }
                     }
                     PlayerAction::Disconnect(reason) => {
-                        let text = TextComponent::text(reason.clone());
-                        let disconnect_pkt = CPlayDisconnect::new(&text);
-                        if let Ok(bytes) = disconnect_pkt.serialize_packet(&client_version) {
-                            let _ = client_tx.send(bytes);
-                        }
-                        return TunnelExit::BackendDisconnected {
-                            reason: Some(reason),
-                        };
+                        return TunnelExit::ProxyDisconnected { reason };
                     }
                     PlayerAction::PluginMessage { channel, data } => {
                         let custom_payload =

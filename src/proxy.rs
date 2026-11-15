@@ -5,6 +5,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use tokio::sync::broadcast;
+use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
 use crate::auth::{Authenticator, KeyStore};
@@ -177,6 +178,8 @@ impl ProxyServer {
         shutdown_tx: broadcast::Sender<()>,
         mut shutdown_rx: broadcast::Receiver<()>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        network::adjust_file_descriptor_limit();
+
         self.command_dispatcher
             .runtime()
             .set_shutdown_sender(shutdown_tx.clone());
@@ -255,7 +258,7 @@ impl ProxyServer {
         if startup_config.bedrock.enabled {
             let bedrock_cfg = startup_config.bedrock.clone();
             let online_players = self.online_players.clone();
-            let bedrock_shutdown = shutdown_rx.resubscribe();
+            let bedrock_shutdown = shutdown_tx.subscribe();
 
             tokio::spawn(async move {
                 if let Err(e) = crate::bedrock::run_bedrock_listener(
@@ -292,7 +295,7 @@ impl ProxyServer {
             })
             .ok();
 
-        let mut stdin_shutdown = shutdown_rx.resubscribe();
+        let mut stdin_shutdown = shutdown_tx.subscribe();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -330,13 +333,16 @@ impl ProxyServer {
             }
         }
 
+        let (telemetry_shutdown_tx, telemetry_shutdown_rx) = broadcast::channel(1);
         let telemetry_handle = telemetry::start_telemetry(
             self.active_config.clone(),
             self.online_players.clone(),
             self.session_manager.clone(),
             self.plugin_manager.clone(),
-            shutdown_rx.resubscribe(),
+            telemetry_shutdown_rx,
         );
+
+        let mut client_tasks: JoinSet<()> = JoinSet::new();
 
         loop {
             tokio::select! {
@@ -353,8 +359,9 @@ impl ProxyServer {
                             let session_manager = self.session_manager.clone();
                             let command_dispatcher = self.command_dispatcher.clone();
                             let plugin_manager = self.plugin_manager.clone();
+                            let mut task_shutdown_rx = shutdown_tx.subscribe();
 
-                            tokio::spawn(async move {
+                            client_tasks.spawn(async move {
                                 if let Err(e) = network::configure_client_socket(&stream, &config.network) {
                                     debug!("[{}] Failed to configure client socket: {}", peer_addr, e);
                                 }
@@ -364,14 +371,27 @@ impl ProxyServer {
                                 let mut leftover_bytes = Vec::new();
 
                                 if config.network.proxy_protocol {
-                                    match network::parse_proxy_protocol(&mut stream, peer_addr).await {
-                                        Ok(res) => {
-                                             effective_addr = res.client_addr;
-                                             leftover_bytes = res.leftover_bytes;
-                                             debug!("[{}] PROXY protocol resolved client IP: {}", peer_addr, effective_addr);
+                                    let handshake_timeout = Duration::from_secs(config.network.client_handshake_timeout_secs);
+                                    let proxy_res = tokio::select! {
+                                        biased;
+                                        _ = task_shutdown_rx.recv() => return,
+                                        res = tokio::time::timeout(
+                                            handshake_timeout,
+                                            network::parse_proxy_protocol(&mut stream, peer_addr),
+                                        ) => res,
+                                    };
+                                    match proxy_res {
+                                        Ok(Ok(res)) => {
+                                            effective_addr = res.client_addr;
+                                            leftover_bytes = res.leftover_bytes;
+                                            debug!("[{}] PROXY protocol resolved client IP: {}", peer_addr, effective_addr);
                                         }
-                                        Err(err) => {
+                                        Ok(Err(err)) => {
                                             warn!("[{}] Dropped connection: PROXY protocol error: {}", peer_addr, err);
+                                            return;
+                                        }
+                                        Err(_) => {
+                                            warn!("[{}] Dropped connection: PROXY protocol header timed out", peer_addr);
                                             return;
                                         }
                                     }
@@ -395,7 +415,7 @@ impl ProxyServer {
                                     plugin_manager,
                                 );
 
-                                if let Err(err) = handler.handle(stream, leftover_bytes).await {
+                                if let Err(err) = handler.handle(stream, leftover_bytes, task_shutdown_rx).await {
                                     debug!("[{}] Connection closed: {}", effective_addr, err);
                                 }
                             });
@@ -406,7 +426,9 @@ impl ProxyServer {
                         }
                     }
                 }
+                Some(_) = client_tasks.join_next(), if !client_tasks.is_empty() => {}
                 _ = shutdown_rx.recv() => {
+                    let _ = shutdown_tx.send(());
                     info!("Shutting down Vine proxy listener...");
                     break;
                 }
@@ -418,15 +440,48 @@ impl ProxyServer {
             }
         }
 
+        drop(listener);
         info!("Vine proxy has stopped accepting connections.");
+
+        let timeout_secs = startup_config.server.shutdown_timeout_secs.max(1);
+        let disconnected_count = self
+            .session_manager
+            .disconnect_all("Proxy is shutting down.");
+        if disconnected_count > 0 {
+            info!(
+                "Sent shutdown disconnect to {} active player session(s).",
+                disconnected_count
+            );
+        }
+
+        if !client_tasks.is_empty() {
+            info!(
+                "Draining {} active client connection(s) (timeout: {}s)...",
+                client_tasks.len(),
+                timeout_secs
+            );
+            let drain_future = async { while client_tasks.join_next().await.is_some() {} };
+            if tokio::time::timeout(Duration::from_secs(timeout_secs), drain_future)
+                .await
+                .is_err()
+            {
+                warn!(
+                    "Shutdown drain timed out after {}s; aborting {} remaining connection(s).",
+                    timeout_secs,
+                    client_tasks.len()
+                );
+                client_tasks.abort_all();
+                while client_tasks.join_next().await.is_some() {}
+            }
+        }
 
         if startup_config.plugins.enabled {
             info!("Unloading plugins...");
             self.plugin_manager.unload_plugins().await;
         }
 
+        let _ = telemetry_shutdown_tx.send(());
         if let Some(handle) = telemetry_handle {
-            let timeout_secs = startup_config.server.shutdown_timeout_secs.max(1);
             let _ = tokio::time::timeout(Duration::from_secs(timeout_secs), handle).await;
         }
 
