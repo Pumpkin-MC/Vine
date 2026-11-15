@@ -868,6 +868,30 @@ impl BackendBridge {
     }
 }
 
+/// The data of a plugin message a client sent. On 1.7 it starts with its length as an i16,
+/// which `SCustomPayload::read` keeps.
+fn plugin_message_data(data: &[u8], version: JavaMinecraftVersion) -> &[u8] {
+    if version < JavaMinecraftVersion::V_1_8 && data.len() >= 2 {
+        &data[2..]
+    } else {
+        data
+    }
+}
+
+/// The body to send after the channel name of a plugin message to a client: on 1.7 the data is
+/// prefixed with its length as an i16.
+fn plugin_message_body(data: Vec<u8>, version: JavaMinecraftVersion) -> Vec<u8> {
+    if version < JavaMinecraftVersion::V_1_8 {
+        let len = i16::try_from(data.len()).unwrap_or(i16::MAX);
+        let mut body = Vec::with_capacity(2 + data.len());
+        body.extend_from_slice(&len.to_be_bytes());
+        body.extend_from_slice(&data[..len as usize]);
+        body
+    } else {
+        data
+    }
+}
+
 #[derive(Clone)]
 struct PendingSuggestion {
     clean_cmd: String,
@@ -1184,7 +1208,8 @@ impl BackendBridge {
                             {
                                 let mut msg_event = PluginMessageEvent {
                                     channel: custom_payload.channel.to_string(),
-                                    data: custom_payload.data.to_vec(),
+                                    data: plugin_message_data(custom_payload.data, client_version)
+                                        .to_vec(),
                                     player_uuid: Some(player_uuid.to_string()),
                                     server_name: Some(current_server_name.clone()),
                                     cancelled: false,
@@ -1459,6 +1484,7 @@ impl BackendBridge {
                         };
                     }
                     PlayerAction::PluginMessage { channel, data } => {
+                        let data = plugin_message_body(data, client_version);
                         let custom_payload =
                             pumpkin_protocol::java::client::play::CCustomPayload::new(
                                 &channel, &data,
@@ -1660,6 +1686,19 @@ mod tests {
                 (0x02, string_payload("/spawn")),
             ]
         );
+    }
+
+    #[test]
+    fn plugin_messages_carry_a_short_length_on_1_7() {
+        let v17 = JavaMinecraftVersion::V_1_7_6;
+        let v18 = JavaMinecraftVersion::V_1_8;
+        assert_eq!(plugin_message_data(&[0, 3, b'a', b'b', b'c'], v17), b"abc");
+        assert_eq!(plugin_message_data(b"abc", v18), b"abc");
+        assert_eq!(
+            plugin_message_body(b"abc".to_vec(), v17),
+            vec![0, 3, b'a', b'b', b'c']
+        );
+        assert_eq!(plugin_message_body(b"abc".to_vec(), v18), b"abc".to_vec());
     }
 
     #[tokio::test]

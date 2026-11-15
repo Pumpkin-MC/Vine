@@ -432,7 +432,7 @@ impl ClientHandler {
         }
 
         let comp_threshold = self.config.server.compression_threshold;
-        if comp_threshold > 0 {
+        if sends_set_compression(comp_threshold, client_version) {
             let set_comp = CSetCompression::new(VarInt(comp_threshold));
             let comp_bytes = set_comp
                 .serialize_for_client(ConnectionState::Login, client_version)
@@ -524,5 +524,62 @@ impl ClientHandler {
         let _ = encoder.write_packet(bytes).await;
         let _ = encoder.flush().await;
         Ok(())
+    }
+}
+
+/// Whether to enable compression for a client. 1.7 has no Set Compression packet and no
+/// compressed framing, so those clients always stay uncompressed (compression is per hop, so the
+/// backend connection can still use it).
+fn sends_set_compression(threshold: i32, version: JavaMinecraftVersion) -> bool {
+    threshold > 0 && version >= JavaMinecraftVersion::V_1_8
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pumpkin_protocol::ser::{NetworkReadExt, NetworkWriteExt};
+
+    #[test]
+    fn no_set_compression_before_1_8() {
+        assert!(!sends_set_compression(256, JavaMinecraftVersion::V_1_7_2));
+        assert!(!sends_set_compression(256, JavaMinecraftVersion::V_1_7_6));
+        assert!(sends_set_compression(256, JavaMinecraftVersion::V_1_8));
+        assert!(sends_set_compression(256, JavaMinecraftVersion::V_26_3));
+        assert!(!sends_set_compression(0, JavaMinecraftVersion::V_26_3));
+        assert!(!sends_set_compression(-1, JavaMinecraftVersion::V_26_3));
+    }
+
+    #[test]
+    fn encryption_request_1_7_uses_short_lengths() {
+        let key = [7u8; 162];
+        let token = [1u8, 2, 3, 4];
+        let bytes = CEncryptionRequest::new("", &key, &token, true)
+            .serialize_for_client(ConnectionState::Login, JavaMinecraftVersion::V_1_7_6)
+            .unwrap();
+        let mut cur = &bytes[..];
+        assert_eq!(cur.get_var_int().unwrap().0, 0x01);
+        assert_eq!(cur.get_str().unwrap().as_ref(), "");
+        assert_eq!(cur.get_i16_be().unwrap(), 162);
+        assert_eq!(&cur[..162], &key[..]);
+        cur = &cur[162..];
+        assert_eq!(cur.get_i16_be().unwrap(), 4);
+        // No `should_authenticate` flag before 1.20.5.
+        assert_eq!(cur, &token[..]);
+    }
+
+    #[test]
+    fn encryption_response_1_7_reads_short_lengths() {
+        let secret = [9u8; 128];
+        let token = [5u8; 128];
+        let mut payload = Vec::new();
+        payload.write_i16_be(secret.len() as i16).unwrap();
+        payload.extend_from_slice(&secret);
+        payload.write_i16_be(token.len() as i16).unwrap();
+        payload.extend_from_slice(&token);
+
+        let response =
+            SEncryptionResponse::read(&mut &payload[..], &JavaMinecraftVersion::V_1_7_6).unwrap();
+        assert_eq!(&response.shared_secret[..], &secret[..]);
+        assert_eq!(&response.verify_token[..], &token[..]);
     }
 }
