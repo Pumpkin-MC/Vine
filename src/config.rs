@@ -53,6 +53,7 @@ pub struct Config {
     pub motd: MotdConfig,
     pub security: SecurityConfig,
     pub routing: RoutingConfig,
+    #[serde(default)]
     pub servers: HashMap<String, BackendConfig>,
     #[serde(default)]
     pub telemetry: TelemetryConfig,
@@ -443,5 +444,17 @@ mod tests {
         assert_eq!(config.interval_secs, 120);
         assert!(config.public);
         assert_eq!(config.server_name.as_deref(), Some("Vine Proxy Hub"));
+    }
+
+    #[test]
+    fn test_servers_section_optional() {
+        // `[servers]` can be left out, for example when every server is added at runtime.
+        let mut value = toml::Value::try_from(Config::default()).unwrap();
+        value.as_table_mut().unwrap().remove("servers");
+        let toml_str = toml::to_string(&value).unwrap();
+        assert!(!toml_str.contains("[servers"));
+
+        let config: Config = toml::from_str(&toml_str).unwrap();
+        assert!(config.servers.is_empty());
     }
 }
