@@ -12,7 +12,7 @@ use pumpkin_protocol::java::packet_encoder::TCPNetworkEncoder;
 use pumpkin_protocol::java::server::handshake::SHandShake;
 use pumpkin_protocol::java::server::login::{SEncryptionResponse, SLoginStart};
 use pumpkin_protocol::java::server::status::SStatusPingRequest;
-use pumpkin_protocol::{ClientPacket, ConnectionState, ServerPacket};
+use pumpkin_protocol::{ConnectionState, ServerPacket};
 use pumpkin_util::version::JavaMinecraftVersion;
 use thiserror::Error;
 use tokio::net::TcpStream;
@@ -27,6 +27,7 @@ use crate::config::Config;
 use crate::network::PrefixedRead;
 use crate::plugin::PluginManager;
 use crate::plugin::api::{PlayerLoginEvent, PlayerPreLoginEvent, ProxyPingEvent};
+use crate::protocol::VersionedPacket;
 use crate::security::Sanitizer;
 use crate::session::SessionManager;
 use crate::status::StatusHandler;
@@ -190,7 +191,7 @@ impl ClientHandler {
                 Some(virtual_host),
             );
             let status_bytes = status_pkt
-                .serialize_packet(&client_version)
+                .serialize_for_client(ConnectionState::Status, client_version)
                 .map_err(|e| ClientError::EncodeError(e.to_string()))?;
             encoder
                 .write_packet(status_bytes)
@@ -209,7 +210,7 @@ impl ClientHandler {
             if let Ok(ping) = SStatusPingRequest::read(&mut ping_bytes, &client_version) {
                 let pong_pkt = StatusHandler::create_pong_packet(ping.payload);
                 let pong_bytes = pong_pkt
-                    .serialize_packet(&client_version)
+                    .serialize_for_client(ConnectionState::Status, client_version)
                     .map_err(|e| ClientError::EncodeError(e.to_string()))?;
                 let _ = encoder.write_packet(pong_bytes).await;
                 let _ = encoder.flush().await;
@@ -228,6 +229,17 @@ impl ClientHandler {
         client_ip: IpAddr,
     ) -> Result<(), ClientError> {
         let login_timeout = Duration::from_secs(self.config.network.client_login_timeout_secs);
+
+        // Vine needs to know the client's packet ids and layouts, so it can't serve a protocol
+        // it doesn't recognise.
+        if client_version == JavaMinecraftVersion::Unknown {
+            warn!(
+                "[{}] Rejecting login from unsupported protocol version",
+                self.peer_addr
+            );
+            Self::kick(&mut encoder, client_version, "Unsupported client version").await?;
+            return Ok(());
+        }
 
         let raw_login_start = timeout(login_timeout, decoder.get_raw_packet())
             .await
@@ -289,7 +301,7 @@ impl ClientHandler {
                 CEncryptionRequest::new("", self.keystore.public_key_der(), &verify_token, true);
 
             let enc_req_bytes = encryption_request
-                .serialize_packet(&client_version)
+                .serialize_for_client(ConnectionState::Login, client_version)
                 .map_err(|e| ClientError::EncodeError(e.to_string()))?;
             encoder
                 .write_packet(enc_req_bytes)
@@ -423,7 +435,7 @@ impl ClientHandler {
         if comp_threshold > 0 {
             let set_comp = CSetCompression::new(VarInt(comp_threshold));
             let comp_bytes = set_comp
-                .serialize_packet(&client_version)
+                .serialize_for_client(ConnectionState::Login, client_version)
                 .map_err(|e| ClientError::EncodeError(e.to_string()))?;
             encoder
                 .write_packet(comp_bytes)
@@ -507,7 +519,7 @@ impl ClientHandler {
         );
         let disconnect = CLoginDisconnect::new(json_reason);
         let bytes = disconnect
-            .serialize_packet(&version)
+            .serialize_for_client(ConnectionState::Login, version)
             .map_err(|e| ClientError::EncodeError(e.to_string()))?;
         let _ = encoder.write_packet(bytes).await;
         let _ = encoder.flush().await;

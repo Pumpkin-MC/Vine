@@ -20,9 +20,8 @@ use pumpkin_protocol::java::server::login::{SLoginPluginResponse, SLoginStart};
 use pumpkin_protocol::java::server::play::{
     SChatCommand, SChatMessage, SCommandSuggestion, SCustomPayload,
 };
-use pumpkin_protocol::packet::MultiVersionJavaPacket;
 use pumpkin_protocol::ser::{NetworkReadExt, NetworkReadSliceExt};
-use pumpkin_protocol::{ClientPacket, ConnectionState, ServerPacket};
+use pumpkin_protocol::{ConnectionState, ServerPacket};
 use pumpkin_util::text::TextComponent;
 use pumpkin_util::version::JavaMinecraftVersion;
 use std::time::Duration;
@@ -44,6 +43,7 @@ use crate::plugin::api::{
     PlayerChatEvent, PlayerCommandEvent, PlayerDisconnectEvent, PlayerJoinEvent,
     PluginMessageEvent, ServerConnectEvent, ServerConnectedEvent,
 };
+use crate::protocol::{self, VersionedPacket};
 use crate::security::PacketRateLimiter;
 use crate::session::{PlayerAction, PlayerSession, SessionManager};
 
@@ -228,7 +228,7 @@ impl BackendBridge {
         };
 
         let handshake_bytes = handshake_packet
-            .serialize_packet(&self.client_version)
+            .serialize_for_server(ConnectionState::HandShake, self.client_version)
             .map_err(|e| BridgeError::EncodeError(e.to_string()))?;
         backend_encoder
             .write_packet(handshake_bytes)
@@ -244,7 +244,7 @@ impl BackendBridge {
             uuid: self.player.id,
         };
         let login_start_bytes = login_start_packet
-            .serialize_packet(&self.client_version)
+            .serialize_for_server(ConnectionState::Login, self.client_version)
             .map_err(|e| BridgeError::EncodeError(e.to_string()))?;
         backend_encoder
             .write_packet(login_start_bytes)
@@ -256,10 +256,21 @@ impl BackendBridge {
             .map_err(|e| BridgeError::EncodeError(e.to_string()))?;
 
         let login_timeout_dur = Duration::from_secs(self.network_config.backend_login_timeout_secs);
-        let login_disconnect_id = CLoginDisconnect::to_id(self.client_version);
-        let login_plugin_request_id = CLoginPluginRequest::to_id(self.client_version);
-        let login_compression_id = CSetCompression::to_id(self.client_version);
-        let login_success_id = CLoginSuccess::to_id(self.client_version);
+        // The backend speaks the client's version, so its ids are the client's.
+        let login_disconnect_id = protocol::clientbound_id::<CLoginDisconnect>(
+            ConnectionState::Login,
+            self.client_version,
+        );
+        let login_plugin_request_id = protocol::clientbound_id::<CLoginPluginRequest>(
+            ConnectionState::Login,
+            self.client_version,
+        );
+        let login_compression_id = protocol::clientbound_id::<CSetCompression>(
+            ConnectionState::Login,
+            self.client_version,
+        );
+        let login_success_id =
+            protocol::clientbound_id::<CLoginSuccess>(ConnectionState::Login, self.client_version);
 
         loop {
             let raw_packet = timeout(login_timeout_dur, backend_decoder.get_raw_packet())
@@ -267,7 +278,7 @@ impl BackendBridge {
                 .map_err(|_| BridgeError::LoginTimeout(server_name.to_string()))?
                 .map_err(|e| BridgeError::DecodeError(e.to_string()))?;
 
-            if raw_packet.id == login_disconnect_id {
+            if Some(raw_packet.id) == login_disconnect_id {
                 let mut cur = &raw_packet.payload[..];
                 let reason = cur
                     .get_str()
@@ -278,7 +289,7 @@ impl BackendBridge {
                     server_name, self.player.username, reason
                 );
                 return Err(BridgeError::LoginDisconnected(reason));
-            } else if raw_packet.id == login_plugin_request_id {
+            } else if Some(raw_packet.id) == login_plugin_request_id {
                 let mut cur = &raw_packet.payload[..];
                 let message_id = cur
                     .get_var_int()
@@ -319,7 +330,7 @@ impl BackendBridge {
                     };
 
                     let resp_bytes = plugin_response
-                        .serialize_packet(&self.client_version)
+                        .serialize_for_server(ConnectionState::Login, self.client_version)
                         .map_err(|e| BridgeError::EncodeError(e.to_string()))?;
                     backend_encoder
                         .write_packet(resp_bytes)
@@ -348,7 +359,7 @@ impl BackendBridge {
                     };
 
                     let resp_bytes = plugin_response
-                        .serialize_packet(&self.client_version)
+                        .serialize_for_server(ConnectionState::Login, self.client_version)
                         .map_err(|e| BridgeError::EncodeError(e.to_string()))?;
                     backend_encoder
                         .write_packet(resp_bytes)
@@ -364,7 +375,7 @@ impl BackendBridge {
                         data: None,
                     };
                     let resp_bytes = plugin_response
-                        .serialize_packet(&self.client_version)
+                        .serialize_for_server(ConnectionState::Login, self.client_version)
                         .map_err(|e| BridgeError::EncodeError(e.to_string()))?;
                     backend_encoder
                         .write_packet(resp_bytes)
@@ -375,7 +386,7 @@ impl BackendBridge {
                         .await
                         .map_err(|e| BridgeError::EncodeError(e.to_string()))?;
                 }
-            } else if raw_packet.id == login_compression_id {
+            } else if Some(raw_packet.id) == login_compression_id {
                 let mut cur = &raw_packet.payload[..];
                 let threshold = cur
                     .get_var_int()
@@ -387,7 +398,7 @@ impl BackendBridge {
                     backend_encoder
                         .set_compression((threshold as usize, self.compression_level as u32));
                 }
-            } else if raw_packet.id == login_success_id {
+            } else if Some(raw_packet.id) == login_success_id {
                 debug!(
                     "Login successful on backend for '{}'!",
                     self.player.username
@@ -565,7 +576,9 @@ impl BackendBridge {
                 }
                 TunnelExit::Transfer { host, port } => {
                     let transfer = CTransfer::new(&host, VarInt(port as i32));
-                    if let Ok(bytes) = transfer.serialize_packet(&self.client_version) {
+                    if let Ok(bytes) =
+                        transfer.serialize_for_client(ConnectionState::Play, self.client_version)
+                    {
                         let _ = client_encoder.write_packet(bytes).await;
                         let _ = client_encoder.flush().await;
                     }
@@ -599,7 +612,9 @@ impl BackendBridge {
                             .unwrap_or("Server switch cancelled by plugin");
                         let msg = TextComponent::text(format!("§c{}", reason));
                         let chat_msg = CSystemChatMessage::new(&msg, false);
-                        if let Ok(bytes) = chat_msg.serialize_packet(&self.client_version) {
+                        if let Ok(bytes) = chat_msg
+                            .serialize_for_client(ConnectionState::Play, self.client_version)
+                        {
                             let _ = client_encoder.write_packet(bytes).await;
                             let _ = client_encoder.flush().await;
                         }
@@ -615,7 +630,9 @@ impl BackendBridge {
                                 server_name
                             ));
                             let chat_msg = CSystemChatMessage::new(&msg, false);
-                            if let Ok(bytes) = chat_msg.serialize_packet(&self.client_version) {
+                            if let Ok(bytes) = chat_msg
+                                .serialize_for_client(ConnectionState::Play, self.client_version)
+                            {
                                 let _ = client_encoder.write_packet(bytes).await;
                                 let _ = client_encoder.flush().await;
                             }
@@ -626,8 +643,10 @@ impl BackendBridge {
                     match self.login_backend(&server_name, &target_config).await {
                         Ok((new_dec, new_enc, _)) => {
                             if self.client_version >= JavaMinecraftVersion::V_1_20_2
-                                && let Ok(bytes) =
-                                    CStartConfiguration.serialize_packet(&self.client_version)
+                                && let Ok(bytes) = CStartConfiguration.serialize_for_client(
+                                    ConnectionState::Play,
+                                    self.client_version,
+                                )
                             {
                                 let _ = client_encoder.write_packet(bytes).await;
                                 let _ = client_encoder.flush().await;
@@ -660,7 +679,9 @@ impl BackendBridge {
                                 server_name, e
                             ));
                             let chat_msg = CSystemChatMessage::new(&msg, false);
-                            if let Ok(bytes) = chat_msg.serialize_packet(&self.client_version) {
+                            if let Ok(bytes) = chat_msg
+                                .serialize_for_client(ConnectionState::Play, self.client_version)
+                            {
                                 let _ = client_encoder.write_packet(bytes).await;
                                 let _ = client_encoder.flush().await;
                             }
@@ -676,7 +697,10 @@ impl BackendBridge {
                                     Ok((new_dec, new_enc, _)) => {
                                         if self.client_version >= JavaMinecraftVersion::V_1_20_2
                                             && let Ok(bytes) = CStartConfiguration
-                                                .serialize_packet(&self.client_version)
+                                                .serialize_for_client(
+                                                    ConnectionState::Play,
+                                                    self.client_version,
+                                                )
                                         {
                                             let _ = client_encoder.write_packet(bytes).await;
                                             let _ = client_encoder.flush().await;
@@ -734,7 +758,9 @@ impl BackendBridge {
                             fb_name, reason_str
                         ));
                         let chat_msg = CSystemChatMessage::new(&notice, false);
-                        if let Ok(bytes) = chat_msg.serialize_packet(&self.client_version) {
+                        if let Ok(bytes) = chat_msg
+                            .serialize_for_client(ConnectionState::Play, self.client_version)
+                        {
                             let _ = client_encoder.write_packet(bytes).await;
                             let _ = client_encoder.flush().await;
                         }
@@ -742,8 +768,10 @@ impl BackendBridge {
                         match self.login_backend(fb_name, fb_cfg).await {
                             Ok((new_dec, new_enc, _)) => {
                                 if self.client_version >= JavaMinecraftVersion::V_1_20_2
-                                    && let Ok(bytes) =
-                                        CStartConfiguration.serialize_packet(&self.client_version)
+                                    && let Ok(bytes) = CStartConfiguration.serialize_for_client(
+                                        ConnectionState::Play,
+                                        self.client_version,
+                                    )
                                 {
                                     let _ = client_encoder.write_packet(bytes).await;
                                     let _ = client_encoder.flush().await;
@@ -825,14 +853,14 @@ impl BackendBridge {
                 reason.replace('"', "\\\"")
             );
             let pkt = CConfigDisconnect::new(&json_reason);
-            if let Ok(bytes) = pkt.serialize_packet(&version) {
+            if let Ok(bytes) = pkt.serialize_for_client(ConnectionState::Config, version) {
                 let _ = encoder.write_packet(bytes).await;
                 let _ = encoder.flush().await;
             }
         } else {
             let kick_reason = TextComponent::text(reason.to_string());
             let pkt = CPlayDisconnect::new(&kick_reason);
-            if let Ok(bytes) = pkt.serialize_packet(&version) {
+            if let Ok(bytes) = pkt.serialize_for_client(ConnectionState::Play, version) {
                 let _ = encoder.write_packet(bytes).await;
                 let _ = encoder.flush().await;
             }
@@ -1033,13 +1061,23 @@ impl BackendBridge {
         W2: AsyncWrite + Unpin,
     {
         let mut client_rate_limiter = PacketRateLimiter::new(max_packets_per_sec);
-        let chat_command_id = SChatCommand::to_id(client_version);
-        let chat_message_id = SChatMessage::to_id(client_version);
-        let custom_payload_id = SCustomPayload::to_id(client_version);
-        let command_suggestion_id = SCommandSuggestion::to_id(client_version);
-        let command_suggestions_clientbound_id = CCommandSuggestions::to_id(client_version);
-        let commands_packet_id = CCommands::to_id(client_version);
-        let play_disconnect_id = CPlayDisconnect::to_id(client_version);
+        // Ids in the client's version; `None` when the client has no such packet. The backend
+        // speaks the client's version too, so clientbound ids are the same on both sides.
+        let play = ConnectionState::Play;
+        let chat_command_id = protocol::serverbound_id::<SChatCommand>(play, client_version);
+        let chat_message_id = protocol::serverbound_id::<SChatMessage>(play, client_version);
+        let custom_payload_id = protocol::serverbound_id::<SCustomPayload>(play, client_version);
+        // Before 1.13 tab completion has no request id and a different response, which Vine
+        // doesn't speak yet, so it passes through untouched.
+        let command_suggestion_id = if client_version >= JavaMinecraftVersion::V_1_13 {
+            protocol::serverbound_id::<SCommandSuggestion>(play, client_version)
+        } else {
+            None
+        };
+        let command_suggestions_clientbound_id =
+            protocol::clientbound_id::<CCommandSuggestions>(play, client_version);
+        let commands_packet_id = protocol::clientbound_id::<CCommands>(play, client_version);
+        let play_disconnect_id = protocol::clientbound_id::<CPlayDisconnect>(play, client_version);
 
         let pending_suggestions: Arc<
             tokio::sync::Mutex<std::collections::HashMap<i32, PendingSuggestion>>,
@@ -1073,7 +1111,7 @@ impl BackendBridge {
                             return TunnelExit::ClientDisconnected;
                         }
 
-                        if raw_packet.id == chat_command_id {
+                        if Some(raw_packet.id) == chat_command_id {
                             let mut payload = &raw_packet.payload[..];
                             if let Ok(chat_cmd) = SChatCommand::read(&mut payload, &client_version)
                             {
@@ -1109,7 +1147,7 @@ impl BackendBridge {
                             }
                         }
 
-                        if raw_packet.id == chat_message_id {
+                        if Some(raw_packet.id) == chat_message_id {
                             let mut payload = &raw_packet.payload[..];
                             if let Ok(chat_msg) = SChatMessage::read(&mut payload, &client_version)
                             {
@@ -1126,7 +1164,7 @@ impl BackendBridge {
                             }
                         }
 
-                        if raw_packet.id == custom_payload_id {
+                        if Some(raw_packet.id) == custom_payload_id {
                             let mut payload = &raw_packet.payload[..];
                             if let Ok(custom_payload) =
                                 SCustomPayload::read(&mut payload, &client_version)
@@ -1145,7 +1183,7 @@ impl BackendBridge {
                             }
                         }
 
-                        if raw_packet.id == command_suggestion_id {
+                        if Some(raw_packet.id) == command_suggestion_id {
                             let mut payload = &raw_packet.payload[..];
                             if let Ok(suggestion_req) =
                                 SCommandSuggestion::read(&mut payload, &client_version)
@@ -1184,7 +1222,9 @@ impl BackendBridge {
                                         VarInt(suggestions.range.len() as i32),
                                         matches,
                                     );
-                                    if let Ok(bytes) = resp.serialize_packet(&client_version) {
+                                    if let Ok(bytes) = resp
+                                        .serialize_for_client(ConnectionState::Play, client_version)
+                                    {
                                         let _ = client_tx.send(bytes);
                                     }
                                     continue;
@@ -1238,7 +1278,9 @@ impl BackendBridge {
                                                     VarInt(pending.clean_cmd.len() as i32),
                                                     suggestions.into_boxed_slice(),
                                                 );
-                                                if let Ok(bytes) = resp.serialize_packet(&cv) {
+                                                if let Ok(bytes) = resp
+                                                    .serialize_for_client(ConnectionState::Play, cv)
+                                                {
                                                     let _ = client_tx_clone.send(bytes);
                                                 }
                                             }
@@ -1273,7 +1315,7 @@ impl BackendBridge {
             loop {
                 match backend_decoder.get_raw_packet().await {
                     Ok(raw_packet) => {
-                        if raw_packet.id == play_disconnect_id {
+                        if Some(raw_packet.id) == play_disconnect_id {
                             let mut cur = &raw_packet.payload[..];
                             let reason = cur
                                 .get_component(&client_version)
@@ -1287,7 +1329,7 @@ impl BackendBridge {
                             return TunnelExit::BackendDisconnected { reason };
                         }
 
-                        if raw_packet.id == command_suggestions_clientbound_id {
+                        if Some(raw_packet.id) == command_suggestions_clientbound_id {
                             let mut cur = &raw_packet.payload[..];
                             if let Ok((id, start, length, mut backend_matches)) =
                                 decode_backend_suggestions(&mut cur, &client_version)
@@ -1313,7 +1355,9 @@ impl BackendBridge {
                                     length,
                                     backend_matches.into_boxed_slice(),
                                 );
-                                if let Ok(bytes) = merged.serialize_packet(&client_version) {
+                                if let Ok(bytes) = merged
+                                    .serialize_for_client(ConnectionState::Play, client_version)
+                                {
                                     if client_tx.send(bytes).is_err() {
                                         return TunnelExit::ClientDisconnected;
                                     }
@@ -1322,7 +1366,7 @@ impl BackendBridge {
                             }
                         }
 
-                        if raw_packet.id == commands_packet_id {
+                        if Some(raw_packet.id) == commands_packet_id {
                             let source = ProxyCommandSource {
                                 sender: CommandSender::Player {
                                     username: username.to_string(),
@@ -1383,14 +1427,18 @@ impl BackendBridge {
                     }
                     PlayerAction::Message(text_comp) => {
                         let chat_msg = CSystemChatMessage::new(&text_comp, false);
-                        if let Ok(bytes) = chat_msg.serialize_packet(&client_version) {
+                        if let Ok(bytes) =
+                            chat_msg.serialize_for_client(ConnectionState::Play, client_version)
+                        {
                             let _ = client_tx.send(bytes);
                         }
                     }
                     PlayerAction::Disconnect(reason) => {
                         let text = TextComponent::text(reason.clone());
                         let disconnect_pkt = CPlayDisconnect::new(&text);
-                        if let Ok(bytes) = disconnect_pkt.serialize_packet(&client_version) {
+                        if let Ok(bytes) = disconnect_pkt
+                            .serialize_for_client(ConnectionState::Play, client_version)
+                        {
                             let _ = client_tx.send(bytes);
                         }
                         return TunnelExit::BackendDisconnected {
@@ -1402,7 +1450,9 @@ impl BackendBridge {
                             pumpkin_protocol::java::client::play::CCustomPayload::new(
                                 &channel, &data,
                             );
-                        if let Ok(bytes) = custom_payload.serialize_packet(&client_version) {
+                        if let Ok(bytes) = custom_payload
+                            .serialize_for_client(ConnectionState::Play, client_version)
+                        {
                             let _ = client_tx.send(bytes);
                         }
                     }
@@ -1425,7 +1475,166 @@ impl BackendBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pumpkin_protocol::ClientPacket;
     use pumpkin_protocol::java::client::play::CommandSuggestion;
+    use pumpkin_protocol::java::packet_decoder::TCPNetworkDecoder as Decoder;
+    use pumpkin_protocol::java::packet_encoder::TCPNetworkEncoder as Encoder;
+    use tokio::io::{DuplexStream, ReadHalf, WriteHalf};
+
+    fn packet_bytes(id: i32, payload: &[u8]) -> Bytes {
+        let mut buf = Vec::new();
+        let _ = VarInt(id).encode(&mut buf);
+        buf.extend_from_slice(payload);
+        Bytes::from(buf)
+    }
+
+    /// A length-prefixed string, as in a 1.12.2 chat or disconnect packet.
+    fn string_payload(s: &str) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let _ = VarInt(s.len() as i32).encode(&mut buf);
+        buf.extend_from_slice(s.as_bytes());
+        buf
+    }
+
+    /// The far ends of a tunnel: what the client and the backend send and see.
+    struct Peers {
+        client: Encoder<WriteHalf<DuplexStream>>,
+        client_view: Decoder<ReadHalf<DuplexStream>>,
+        backend: Encoder<WriteHalf<DuplexStream>>,
+        backend_view: Decoder<ReadHalf<DuplexStream>>,
+    }
+
+    impl Peers {
+        async fn send_from_client(&mut self, packet: Bytes) {
+            self.client.write_packet(packet).await.unwrap();
+            self.client.flush().await.unwrap();
+        }
+
+        async fn send_from_backend(&mut self, packet: Bytes) {
+            self.backend.write_packet(packet).await.unwrap();
+            self.backend.flush().await.unwrap();
+        }
+
+        async fn next_to_client(&mut self) -> pumpkin_protocol::RawPacket {
+            timeout(Duration::from_secs(5), self.client_view.get_raw_packet())
+                .await
+                .expect("nothing reached the client")
+                .unwrap()
+        }
+    }
+
+    /// Runs `bridge_tunnel` for a client on `version` while `drive` plays both peers. Returns
+    /// how the tunnel ended and the packets the backend received.
+    async fn run_tunnel<F, Fut>(
+        version: JavaMinecraftVersion,
+        drive: F,
+    ) -> (TunnelExit, Vec<pumpkin_protocol::RawPacket>)
+    where
+        F: FnOnce(Peers) -> Fut,
+        Fut: std::future::Future<Output = Peers>,
+    {
+        let (proxy_client, client) = tokio::io::duplex(1 << 16);
+        let (proxy_backend, backend) = tokio::io::duplex(1 << 16);
+        let (proxy_client_read, proxy_client_write) = tokio::io::split(proxy_client);
+        let (proxy_backend_read, proxy_backend_write) = tokio::io::split(proxy_backend);
+        let (client_read, client_write) = tokio::io::split(client);
+        let (backend_read, backend_write) = tokio::io::split(backend);
+
+        let mut client_decoder = Decoder::new(proxy_client_read);
+        let mut client_encoder = Encoder::new(proxy_client_write);
+        let mut backend_decoder = Decoder::new(proxy_backend_read);
+        let mut backend_encoder = Encoder::new(proxy_backend_write);
+        let peers = Peers {
+            client: Encoder::new(client_write),
+            client_view: Decoder::new(client_read),
+            backend: Encoder::new(backend_write),
+            backend_view: Decoder::new(backend_read),
+        };
+
+        let plugins_dir = tempfile::tempdir().unwrap();
+        let plugin_manager = PluginManager::new(plugins_dir.path().to_path_buf()).unwrap();
+        let (action_tx, mut action_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let tunnel = BackendBridge::bridge_tunnel(
+            "tester",
+            &mut client_decoder,
+            &mut client_encoder,
+            &mut backend_decoder,
+            &mut backend_encoder,
+            1000,
+            version,
+            &mut action_rx,
+            &action_tx,
+            Arc::new(CommandDispatcher::new()),
+            Arc::new(Config::default()),
+            Arc::new(SessionManager::new()),
+            plugin_manager,
+            uuid::Uuid::nil(),
+            "lobby".to_string(),
+        );
+        let (exit, mut peers) = tokio::join!(
+            async { timeout(Duration::from_secs(10), tunnel).await },
+            drive(peers)
+        );
+        let exit = exit.expect("tunnel did not end").unwrap();
+
+        // Close the proxy's side of the backend pipe, then collect what the backend got.
+        drop(backend_encoder);
+        drop(backend_decoder);
+        let mut to_backend = Vec::new();
+        while let Ok(Ok(packet)) =
+            timeout(Duration::from_secs(5), peers.backend_view.get_raw_packet()).await
+        {
+            to_backend.push(packet);
+        }
+        (exit, to_backend)
+    }
+
+    #[tokio::test]
+    async fn proxy_command_is_read_and_answered_with_client_ids() {
+        // 1.20.4: chat_command is 0x04 and system chat 0x69 (current: 0x07 and 0x7c).
+        let version = JavaMinecraftVersion::V_1_20_3;
+        let (exit, to_backend) = run_tunnel(version, |mut peers| async move {
+            peers
+                .send_from_client(packet_bytes(0x04, &string_payload("help")))
+                .await;
+            assert_eq!(peers.next_to_client().await.id, 0x69);
+            peers.send_from_backend(packet_bytes(0x1b, &[])).await;
+            peers
+        })
+        .await;
+        assert!(matches!(exit, TunnelExit::BackendDisconnected { .. }));
+        assert!(
+            to_backend.is_empty(),
+            "the proxy command reached the backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_disconnect_uses_the_client_id() {
+        // On 1.12.2, 0x20 is chunk data and 0x1a is disconnect. Vine used to match the current
+        // disconnect id (0x20), so the first chunk ended the connection.
+        let version = JavaMinecraftVersion::V_1_12_2;
+        let (exit, _) = run_tunnel(version, |mut peers| async move {
+            peers
+                .send_from_backend(packet_bytes(0x20, &[1, 2, 3]))
+                .await;
+            let forwarded = peers.next_to_client().await;
+            assert_eq!(forwarded.id, 0x20);
+            assert_eq!(&forwarded.payload[..], &[1, 2, 3]);
+
+            let reason = string_payload(r#"{"text":"bye"}"#);
+            peers.send_from_backend(packet_bytes(0x1a, &reason)).await;
+            peers
+        })
+        .await;
+        match exit {
+            TunnelExit::BackendDisconnected { reason } => {
+                assert_eq!(reason.as_deref(), Some("bye"));
+            }
+            other => panic!("unexpected exit: {other:?}"),
+        }
+    }
 
     #[test]
     fn test_decode_backend_suggestions() {
