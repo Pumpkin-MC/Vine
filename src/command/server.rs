@@ -59,10 +59,12 @@ impl CommandExecutor<ProxyCommandSource> for ServerInfoCommandExecutor {
                     .map(|s| s.current_server)
                     .unwrap_or_else(|| "unknown".to_string());
 
-                context.source.send_message(TextComponent::text(format!(
-                    "§6[Vine] §fYou are currently connected to server '§a{}§f'.\n§6[Vine] §7Available servers: §e{}",
-                    current, servers_str
-                )));
+                context
+                    .source
+                    .send_message(crate::console::legacy_component(format!(
+                        "§6[Vine] §fYou are currently connected to server '§a{}§f'.\n§6[Vine] §7Available servers: §e{}",
+                        current, servers_str
+                    )));
             }
             CommandSender::Console => {
                 context.source.send_message(TextComponent::text(format!(
@@ -133,10 +135,12 @@ impl CommandExecutor<ProxyCommandSource> for ServerSwitchCommandExecutor {
             )));
         }
 
-        context.source.send_message(TextComponent::text(format!(
-            "§6[Vine] §eConnecting you to '§a{}§e'...",
-            target_server
-        )));
+        context
+            .source
+            .send_message(crate::console::legacy_component(format!(
+                "§6[Vine] §eConnecting you to '§a{}§e'...",
+                target_server
+            )));
 
         let _ = action_tx.send(PlayerAction::Connect {
             server_name: target_server,
@@ -173,7 +177,20 @@ mod tests {
         let mut dispatcher = RawCommandDispatcher::new();
         register(&mut dispatcher);
 
-        let config = Arc::new(Config::default());
+        let mut config = Config::default();
+        config.servers.insert(
+            "survival".to_string(),
+            crate::config::BackendConfig {
+                address: "127.0.0.1:25567".to_string(),
+                forwarding: crate::config::ForwardingMode::Velocity,
+                secret: Some("secret".to_string()),
+                public_key: None,
+                icon_path: None,
+                motd_line1: None,
+                motd_line2: None,
+            },
+        );
+        let config = Arc::new(config);
         let session_manager = Arc::new(SessionManager::new());
         let (action_tx, mut action_rx) = mpsc::unbounded_channel();
 

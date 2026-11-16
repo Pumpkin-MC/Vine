@@ -50,7 +50,7 @@ pub struct BedrockConfig {
     #[serde(default = "default_bind_address")]
     pub bind_address: String,
     /// Whether encrypted NetherNet LAN discovery on UDP port 7551 is enabled.
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub lan_discovery: bool,
     /// Whether Xbox Live / Mojang identity authentication is required (`accepts_self_signed = !online_mode`).
     #[serde(default = "default_true")]
@@ -92,7 +92,7 @@ impl Default for BedrockConfig {
         Self {
             enabled: default_true(),
             bind_address: default_bind_address(),
-            lan_discovery: default_true(),
+            lan_discovery: false,
             online_mode: default_true(),
             hardcore: false,
             motd: default_motd(),

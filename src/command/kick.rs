@@ -6,7 +6,6 @@ use pumpkin_command::dispatcher::CommandDispatcher as RawCommandDispatcher;
 use pumpkin_command::node::{CommandExecutor, CommandExecutorResult};
 use pumpkin_command::suggestion::provider::{SuggestionProvider, SuggestionProviderResult};
 use pumpkin_command::suggestion::suggestions::SuggestionsBuilder;
-use pumpkin_util::text::TextComponent;
 use tracing::info;
 
 use super::{ProxyCommandSource, command_error, translate_color_codes};
@@ -66,13 +65,15 @@ fn execute_kick(
         "Player '{}' was kicked from proxy by {} (reason: {})",
         session.username,
         context.source.sender.name(),
-        reason
+        crate::console::format_console_text(&reason)
     );
 
-    context.source.send_message(TextComponent::text(format!(
-        "Kicked '{}' from the proxy ({}).",
-        session.username, reason
-    )));
+    context
+        .source
+        .send_message(crate::console::legacy_component(format!(
+            "Kicked '{}' from the proxy ({reason}§r).",
+            session.username
+        )));
     Ok(1)
 }
 

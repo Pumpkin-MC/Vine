@@ -6,7 +6,6 @@ use pumpkin_command::argument_types::core::string::StringArgumentType;
 use pumpkin_command::context::command_context::CommandContext;
 use pumpkin_command::dispatcher::CommandDispatcher as RawCommandDispatcher;
 use pumpkin_command::node::{CommandExecutor, CommandExecutorResult};
-use pumpkin_util::text::TextComponent;
 use tracing::info;
 
 use super::{CommandRuntime, ProxyCommandSource, command_error, translate_color_codes};
@@ -44,13 +43,14 @@ fn execute_shutdown(
         "Proxy shutdown initiated by {} (disconnected {} player(s), reason: {})",
         context.source.sender.name(),
         sessions.len(),
-        reason
+        crate::console::format_console_text(&reason)
     );
 
-    context.source.send_message(TextComponent::text(format!(
-        "§6[Vine] §eShutting down proxy ({})...",
-        reason
-    )));
+    context
+        .source
+        .send_message(crate::console::legacy_component(format!(
+            "§6[Vine] §eShutting down proxy ({reason}§e)..."
+        )));
 
     let _ = runtime.trigger_shutdown();
     Ok(1)

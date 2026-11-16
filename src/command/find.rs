@@ -8,7 +8,6 @@ use pumpkin_command::dispatcher::CommandDispatcher as RawCommandDispatcher;
 use pumpkin_command::node::{CommandExecutor, CommandExecutorResult};
 use pumpkin_command::suggestion::provider::{SuggestionProvider, SuggestionProviderResult};
 use pumpkin_command::suggestion::suggestions::SuggestionsBuilder;
-use pumpkin_util::text::TextComponent;
 use pumpkin_util::version::JavaMinecraftVersion;
 
 use super::{ProxyCommandSource, command_error, format_duration_secs};
@@ -90,7 +89,9 @@ impl CommandExecutor<ProxyCommandSource> for FindCommandExecutor {
             online_for,
         );
 
-        context.source.send_message(TextComponent::text(info_msg));
+        context
+            .source
+            .send_message(crate::console::legacy_component(info_msg));
         Ok(1)
     }
 }
@@ -135,13 +136,19 @@ mod tests {
             view_distance: Some(12),
         });
 
+        let mut admin_cfg = Config::default();
+        admin_cfg.permissions.users.insert(
+            "AdminUser".to_string(),
+            crate::config::UserPermissionConfig::Groups(vec!["admin".to_string()]),
+        );
+
         let (admin_tx, mut admin_rx) = mpsc::unbounded_channel();
         let source = ProxyCommandSource {
             sender: CommandSender::Player {
-                username: "Alex".to_string(),
+                username: "AdminUser".to_string(),
                 action_tx: admin_tx,
             },
-            config: Arc::new(Config::default()),
+            config: Arc::new(admin_cfg),
             session_manager,
         };
 

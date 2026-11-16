@@ -286,7 +286,9 @@ impl CommandExecutor<ProxyCommandSource> for VineInfoExecutor {
             cfg.servers.len(),
             cfg.routing.default_server,
         );
-        context.source.send_message(TextComponent::text(msg));
+        context
+            .source
+            .send_message(crate::console::legacy_component(msg));
         Ok(1)
     }
 }
@@ -305,9 +307,11 @@ impl CommandExecutor<ProxyCommandSource> for VinePluginsExecutor {
 
         let plugins = self.runtime.loaded_plugin_details();
         if plugins.is_empty() {
-            context.source.send_message(TextComponent::text(
-                "§6[Vine] §7No WASM plugins are currently loaded.",
-            ));
+            context
+                .source
+                .send_message(crate::console::legacy_component(
+                    "§6[Vine] §7No WASM plugins are currently loaded.",
+                ));
             return Ok(0);
         }
 
@@ -331,7 +335,7 @@ impl CommandExecutor<ProxyCommandSource> for VinePluginsExecutor {
 
         context
             .source
-            .send_message(TextComponent::text(lines.join("\n")));
+            .send_message(crate::console::legacy_component(lines.join("\n")));
         Ok(plugins.len() as i32)
     }
 }
@@ -358,12 +362,12 @@ impl CommandExecutor<ProxyCommandSource> for VinePluginsReloadExecutor {
         tokio::spawn(async move {
             match plugin_manager.reload_plugins().await {
                 Ok(count) => {
-                    sender.send_message(TextComponent::text(format!(
+                    sender.send_message(crate::console::legacy_component(format!(
                         "§6[Vine] §aReloaded WASM plugins successfully ({count} active)."
                     )));
                 }
                 Err(err) => {
-                    sender.send_message(TextComponent::text(format!(
+                    sender.send_message(crate::console::legacy_component(format!(
                         "§6[Vine] §cFailed to reload WASM plugins: {err}"
                     )));
                 }
@@ -434,7 +438,7 @@ impl CommandExecutor<ProxyCommandSource> for VineServersExecutor {
 
         context
             .source
-            .send_message(TextComponent::text(lines.join("\n")));
+            .send_message(crate::console::legacy_component(lines.join("\n")));
         Ok(cfg.servers.len() as i32)
     }
 }
@@ -453,11 +457,13 @@ impl CommandExecutor<ProxyCommandSource> for VineReloadExecutor {
 
         match self.runtime.reload_config() {
             Ok(new_cfg) => {
-                context.source.send_message(TextComponent::text(format!(
-                    "§6[Vine] §aConfiguration reloaded successfully ({} backend server(s), default: '{}').",
-                    new_cfg.servers.len(),
-                    new_cfg.routing.default_server
-                )));
+                context
+                    .source
+                    .send_message(crate::console::legacy_component(format!(
+                        "§6[Vine] §aConfiguration reloaded successfully ({} backend server(s), default: '{}').",
+                        new_cfg.servers.len(),
+                        new_cfg.routing.default_server
+                    )));
                 Ok(1)
             }
             Err(err) => Err(command_error(format!(
@@ -729,13 +735,19 @@ mod tests {
             Ok(Arc::new(cfg))
         }));
 
+        let mut admin_cfg = Config::default();
+        admin_cfg.permissions.users.insert(
+            "AdminUser".to_string(),
+            crate::config::UserPermissionConfig::Groups(vec!["admin".to_string()]),
+        );
+
         let (tx, mut rx) = mpsc::unbounded_channel();
         let admin_player_source = ProxyCommandSource {
             sender: CommandSender::Player {
-                username: "Alex".to_string(),
+                username: "AdminUser".to_string(),
                 action_tx: tx,
             },
-            config: Arc::new(Config::default()),
+            config: Arc::new(admin_cfg),
             session_manager: Arc::new(SessionManager::new()),
         };
 

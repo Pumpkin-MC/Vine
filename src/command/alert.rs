@@ -27,7 +27,7 @@ impl CommandExecutor<ProxyCommandSource> for AlertCommandExecutor {
 
         let formatted_body = translate_color_codes(raw_message);
         let formatted_alert = format!("§8[§c§lAlert§8] §r{formatted_body}");
-        let component = TextComponent::text(formatted_alert);
+        let component = crate::console::legacy_component(&formatted_alert);
 
         let sessions = context.source.session_manager.list_sessions();
         let recipient_count = sessions.len();
@@ -40,7 +40,7 @@ impl CommandExecutor<ProxyCommandSource> for AlertCommandExecutor {
         info!(
             "[Alert by {}] {}",
             context.source.sender.name(),
-            component.to_pretty_console()
+            crate::console::format_console_component(&component)
         );
 
         if matches!(context.source.sender, CommandSender::Console) {

@@ -391,9 +391,9 @@ impl BackendBridge {
                     .0;
                 debug!("Backend enabled compression threshold: {} bytes", threshold);
                 if threshold >= 0 {
+                    let comp_level = self.compression_level.clamp(0, 9) as u32;
                     backend_decoder.set_compression(threshold as usize);
-                    backend_encoder
-                        .set_compression((threshold as usize, self.compression_level as u32));
+                    backend_encoder.set_compression((threshold as usize, comp_level));
                 }
             } else if raw_packet.id == login_success_id {
                 debug!(
@@ -607,7 +607,8 @@ impl BackendBridge {
                 TunnelExit::ProxyDisconnected { reason } => {
                     info!(
                         "Disconnecting player '{}' from proxy: {}",
-                        self.player.username, reason
+                        self.player.username,
+                        crate::console::format_console_text(&reason)
                     );
                     match client_state {
                         ConnectionState::Play => {
@@ -656,7 +657,7 @@ impl BackendBridge {
                             .cancel_reason
                             .as_deref()
                             .unwrap_or("Server switch cancelled by plugin");
-                        let msg = TextComponent::text(format!("§c{}", reason));
+                        let msg = crate::console::legacy_component(format!("§c{reason}"));
                         let chat_msg = CSystemChatMessage::new(&msg, false);
                         if let Ok(bytes) = chat_msg.serialize_packet(&self.client_version) {
                             let _ = client_encoder.write_packet(bytes).await;
@@ -714,9 +715,8 @@ impl BackendBridge {
                                 "Failed to switch player '{}' to '{}': {}",
                                 self.player.username, server_name, e
                             );
-                            let msg = TextComponent::text(format!(
-                                "§cFailed to connect to server '{}': {}",
-                                server_name, e
+                            let msg = crate::console::legacy_component(format!(
+                                "§cFailed to connect to server '{server_name}': {e}"
                             ));
                             let chat_msg = CSystemChatMessage::new(&msg, false);
                             if let Ok(bytes) = chat_msg.serialize_packet(&self.client_version) {
@@ -785,12 +785,14 @@ impl BackendBridge {
                         let reason_str = reason.as_deref().unwrap_or("Server closed");
                         info!(
                             "Rerouting player '{}' to fallback server '{}' (kicked from '{}': {})",
-                            self.player.username, fb_name, current_server_name, reason_str
+                            self.player.username,
+                            fb_name,
+                            current_server_name,
+                            crate::console::format_console_text(reason_str)
                         );
 
-                        let notice = TextComponent::text(format!(
-                            "§eConnecting to fallback server '{}'... (§c{}§e)",
-                            fb_name, reason_str
+                        let notice = crate::console::legacy_component(format!(
+                            "§eConnecting to fallback server '{fb_name}'... (§c{reason_str}§e)"
                         ));
                         let chat_msg = CSystemChatMessage::new(&notice, false);
                         if let Ok(bytes) = chat_msg.serialize_packet(&self.client_version) {
@@ -889,7 +891,7 @@ impl BackendBridge {
                 let _ = encoder.flush().await;
             }
         } else {
-            let kick_reason = TextComponent::text(reason.to_string());
+            let kick_reason = crate::console::legacy_component(reason);
             let pkt = CPlayDisconnect::new(&kick_reason);
             if let Ok(bytes) = pkt.serialize_packet(&version) {
                 let _ = encoder.write_packet(bytes).await;
@@ -1129,9 +1131,25 @@ impl BackendBridge {
         };
 
         let client_to_backend = async {
+            let max_packet_size = proxy_config.security.max_packet_size;
             loop {
                 match client_decoder.get_raw_packet().await {
                     Ok(raw_packet) => {
+                        if max_packet_size > 0
+                            && !crate::security::Sanitizer::is_valid_packet_size(
+                                raw_packet.payload.len(),
+                                max_packet_size,
+                            )
+                        {
+                            warn!(
+                                "Player '{}' sent oversized packet ({} bytes > max {} bytes)",
+                                username,
+                                raw_packet.payload.len(),
+                                max_packet_size
+                            );
+                            return TunnelExit::ClientDisconnected;
+                        }
+
                         if !client_rate_limiter.record_packet() {
                             warn!(
                                 "Player '{}' exceeded packet rate limit (flood protection kicked in)",
@@ -1452,7 +1470,9 @@ impl BackendBridge {
                             let mut cur = &raw_packet.payload[..];
                             let reason = cur
                                 .get_component(&client_version)
-                                .map(|c| c.to_pretty_console())
+                                .map(|c| {
+                                    c.to_legacy_string(pumpkin_util::translation::Locale::EnUs)
+                                })
                                 .ok()
                                 .or_else(|| {
                                     let s =

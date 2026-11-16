@@ -8,11 +8,14 @@ use vine::proxy::ProxyServer;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let ansi = vine::console::console_ansi_enabled();
     tracing_subscriber::registry()
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .with(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,vine=debug")),
+            tracing_subscriber::fmt::layer()
+                .with_ansi(ansi)
+                .with_ansi_sanitization(false),
         )
-        .with(tracing_subscriber::fmt::layer())
         .init();
 
     let (config_path, init_settings) = parse_cli_args(std::env::args().skip(1));

@@ -448,7 +448,7 @@ impl ClientHandler {
         }
 
         let comp_threshold = self.config.server.compression_threshold;
-        if comp_threshold > 0 {
+        if comp_threshold >= 0 {
             let set_comp = CSetCompression::new(VarInt(comp_threshold));
             let comp_bytes = set_comp
                 .serialize_packet(&client_version)
@@ -462,11 +462,9 @@ impl ClientHandler {
                 .await
                 .map_err(|e| ClientError::EncodeError(e.to_string()))?;
 
+            let comp_level = self.config.server.compression_level.clamp(0, 9) as u32;
             decoder.set_compression(comp_threshold as usize);
-            encoder.set_compression((
-                comp_threshold as usize,
-                self.config.server.compression_level as u32,
-            ));
+            encoder.set_compression((comp_threshold as usize, comp_level));
         }
 
         let (server_name, backend_cfg) = match self.router.resolve_server(&virtual_host) {

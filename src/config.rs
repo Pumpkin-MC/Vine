@@ -46,21 +46,18 @@ fn default_listen_backlog() -> u32 {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Config {
     pub server: ServerConfig,
-    #[serde(default)]
     pub network: NetworkConfig,
     pub motd: MotdConfig,
     pub security: SecurityConfig,
     pub routing: RoutingConfig,
+    #[serde(default = "default_servers")]
     pub servers: HashMap<String, BackendConfig>,
-    #[serde(default)]
     pub telemetry: TelemetryConfig,
-    #[serde(default)]
     pub bedrock: crate::bedrock::BedrockConfig,
-    #[serde(default)]
     pub permissions: PermissionsConfig,
-    #[serde(default)]
     pub plugins: PluginConfig,
 }
 
@@ -151,15 +148,29 @@ impl Default for PluginConfig {
     }
 }
 
+fn default_bind_address() -> String {
+    "0.0.0.0:25565".to_string()
+}
+
+const fn default_compression_threshold() -> i32 {
+    256
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ServerConfig {
     /// Address and port for the proxy to listen on
+    #[serde(default = "default_bind_address")]
     pub bind_address: String,
     /// Whether to verify player accounts with Mojang session servers
+    #[serde(default = "default_true")]
     pub online_mode: bool,
-    /// Send player IP to Mojang during session authentication to prevent proxy hijacking
+    /// Send player IP to Mojang during session authentication to prevent proxy hijacking.
+    /// Disabled by default (matching Vanilla/Velocity) to avoid breaking localhost, NAT/CGNAT, and dual-stack IPv4/IPv6 logins.
+    #[serde(default)]
     pub prevent_proxy_connections: bool,
     /// Packet compression threshold (-1 to disable, e.g. 256 for standard compression)
+    #[serde(default = "default_compression_threshold")]
     pub compression_threshold: i32,
     /// zlib / flate2 compression level (1 = fastest, 6 = default balance, 9 = best compression)
     #[serde(default = "default_compression_level")]
@@ -167,6 +178,19 @@ pub struct ServerConfig {
     /// Graceful shutdown timeout in seconds to wait for active connections to close
     #[serde(default = "default_shutdown_timeout")]
     pub shutdown_timeout_secs: u64,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            bind_address: default_bind_address(),
+            online_mode: true,
+            prevent_proxy_connections: false,
+            compression_threshold: default_compression_threshold(),
+            compression_level: default_compression_level(),
+            shutdown_timeout_secs: default_shutdown_timeout(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -246,6 +270,7 @@ impl Default for NetworkConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MotdConfig {
     /// Line 1 of the server list ping description
     pub line1: String,
@@ -258,16 +283,36 @@ pub struct MotdConfig {
     /// Protocol version reported to clients (776 is 26.2)
     pub protocol_version: i32,
     /// Optional sample player list shown on hover in server list
+    #[serde(default)]
     pub sample_players: Vec<String>,
     /// Optional path to a 64x64 PNG file for the server list icon (favicons)
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon_path: Option<String>,
     /// Whether to show the player sample list on hover in the multiplayer menu
     #[serde(default = "default_true")]
     pub show_sample_players: bool,
 }
 
+impl Default for MotdConfig {
+    fn default() -> Self {
+        Self {
+            line1: "§a§lVine §7» §fHigh-Performance Minecraft Proxy".to_string(),
+            line2: "§7Multi-version support §8• §e1.7.x - 26.x".to_string(),
+            max_players: 100,
+            version_name: "Vine 1.7.x - 26.x".to_string(),
+            protocol_version: 776,
+            sample_players: vec![
+                "§aVine Multi-Version Proxy".to_string(),
+                "§7Secure • Fast • Reliable".to_string(),
+            ],
+            icon_path: None,
+            show_sample_players: true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SecurityConfig {
     /// Enable connection rate limiting per IP
     pub rate_limit_enabled: bool,
@@ -275,31 +320,59 @@ pub struct SecurityConfig {
     pub max_connections_per_sec: u32,
     /// Burst allowance for new connections
     pub connection_burst: u32,
-    /// Maximum packets per second from a single client before being kicked for flooding
+    /// Maximum packets per second from a single client before being kicked for flooding (0 to disable)
     pub max_packets_per_sec: u32,
-    /// Maximum raw packet size allowed in bytes (default 2MB)
+    /// Maximum raw packet size allowed in bytes (default 2MB, 0 to use protocol limit)
     pub max_packet_size: usize,
     /// Enforce strict Minecraft username validation (^[a-zA-Z0-9_]{2,16}$)
     pub validate_usernames: bool,
 }
 
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            rate_limit_enabled: true,
+            max_connections_per_sec: 5,
+            connection_burst: 10,
+            max_packets_per_sec: 1000,
+            max_packet_size: 2 * 1024 * 1024,
+            validate_usernames: true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RoutingConfig {
     /// Default backend server name to connect to
     pub default_server: String,
     /// Fallback server if default server is offline
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_server: Option<String>,
-    /// Virtual host routing: maps domain/hostname to backend server name
-    pub forced_hosts: HashMap<String, String>,
     /// Automatically try fallback server if connection to target server fails
     #[serde(default = "default_true")]
     pub try_fallback_on_connect_failure: bool,
+    /// Virtual host routing: maps domain/hostname to backend server name
+    #[serde(default)]
+    pub forced_hosts: HashMap<String, String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            default_server: "lobby".to_string(),
+            fallback_server: None,
+            try_fallback_on_connect_failure: true,
+            forced_hosts: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ForwardingMode {
     /// Plain connection without forwarding info (for Vanilla servers in offline-mode)
+    #[default]
     None,
     /// BungeeCord IP forwarding (for Bukkit, Spigot, PaperMC with bungeecord: true)
     BungeeCord,
@@ -314,21 +387,23 @@ pub struct BackendConfig {
     /// Address of backend server (e.g. "127.0.0.1:25566")
     pub address: String,
     /// Forwarding mode to use when connecting to this backend
+    #[serde(default)]
     pub forwarding: ForwardingMode,
     /// Secret key required if forwarding mode is Velocity or Vine
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
     /// Optional 64-character hex Ed25519 telemetry public key of this backend server
     /// for cryptographic topology verification in Pumpkin Account
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_key: Option<String>,
     /// Optional custom 64x64 PNG status icon path for this backend / virtual host
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon_path: Option<String>,
     /// Optional custom MOTD Line 1 for this backend / virtual host
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub motd_line1: Option<String>,
     /// Optional custom MOTD Line 2 for this backend / virtual host
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub motd_line2: Option<String>,
 }
 
@@ -385,88 +460,32 @@ pub fn generate_forwarding_secret() -> String {
     hex::encode(bytes)
 }
 
+fn default_servers() -> HashMap<String, BackendConfig> {
+    let mut servers = HashMap::new();
+    servers.insert(
+        "lobby".to_string(),
+        BackendConfig {
+            address: "127.0.0.1:25566".to_string(),
+            forwarding: ForwardingMode::Velocity,
+            secret: Some(generate_forwarding_secret()),
+            public_key: None,
+            icon_path: None,
+            motd_line1: None,
+            motd_line2: None,
+        },
+    );
+    servers
+}
+
 impl Default for Config {
     fn default() -> Self {
-        let mut servers = HashMap::new();
-        servers.insert(
-            "lobby".to_string(),
-            BackendConfig {
-                address: "127.0.0.1:25566".to_string(),
-                forwarding: ForwardingMode::Velocity,
-                secret: Some(generate_forwarding_secret()),
-                public_key: None,
-                icon_path: None,
-                motd_line1: None,
-                motd_line2: None,
-            },
-        );
-        servers.insert(
-            "survival".to_string(),
-            BackendConfig {
-                address: "127.0.0.1:25567".to_string(),
-                forwarding: ForwardingMode::BungeeCord,
-                secret: None,
-                public_key: None,
-                icon_path: None,
-                motd_line1: Some("§b§lVine Survival §7» §fWelcome back!".to_string()),
-                motd_line2: Some("§7Custom world • Economy • Land Claims".to_string()),
-            },
-        );
-        servers.insert(
-            "vanilla".to_string(),
-            BackendConfig {
-                address: "127.0.0.1:25568".to_string(),
-                forwarding: ForwardingMode::None,
-                secret: None,
-                public_key: None,
-                icon_path: None,
-                motd_line1: None,
-                motd_line2: None,
-            },
-        );
-
-        let mut forced_hosts = HashMap::new();
-        forced_hosts.insert("survival.example.com".to_string(), "survival".to_string());
-        forced_hosts.insert("vanilla.example.com".to_string(), "vanilla".to_string());
-
         Self {
-            server: ServerConfig {
-                bind_address: "0.0.0.0:25565".to_string(),
-                online_mode: true,
-                prevent_proxy_connections: true,
-                compression_threshold: 256,
-                compression_level: 6,
-                shutdown_timeout_secs: 10,
-            },
+            server: ServerConfig::default(),
             network: NetworkConfig::default(),
-            motd: MotdConfig {
-                line1: "§a§lVine §7» §fHigh-Performance Minecraft Proxy".to_string(),
-                line2: "§7Multi-version support §8• §e1.7.x - 26.x".to_string(),
-                max_players: 100,
-                version_name: "Vine 1.7.x - 26.x".to_string(),
-                protocol_version: 776,
-                sample_players: vec![
-                    "§aVine Multi-Version Proxy".to_string(),
-                    "§7Secure • Fast • Reliable".to_string(),
-                ],
-                icon_path: None,
-                show_sample_players: true,
-            },
-            security: SecurityConfig {
-                rate_limit_enabled: true,
-                max_connections_per_sec: 5,
-                connection_burst: 10,
-                max_packets_per_sec: 500,
-                max_packet_size: 2 * 1024 * 1024,
-                validate_usernames: true,
-            },
-            routing: RoutingConfig {
-                default_server: "lobby".to_string(),
-                fallback_server: Some("survival".to_string()),
-                forced_hosts,
-                try_fallback_on_connect_failure: true,
-            },
-            servers,
+            motd: MotdConfig::default(),
+            security: SecurityConfig::default(),
+            routing: RoutingConfig::default(),
+            servers: default_servers(),
             telemetry: TelemetryConfig::default(),
             bedrock: crate::bedrock::BedrockConfig::default(),
             permissions: PermissionsConfig::default(),
@@ -604,5 +623,33 @@ mod tests {
         assert_eq!(secret1.len(), 64);
         assert!(hex::decode(secret1).is_ok());
         assert_ne!(secret1, secret2);
+    }
+
+    #[test]
+    fn test_default_config_roundtrip_and_minimal_toml() {
+        let default_cfg = Config::default();
+        assert!(!default_cfg.server.prevent_proxy_connections);
+        assert!(default_cfg.permissions.users.is_empty());
+        assert_eq!(default_cfg.servers.len(), 1);
+        assert!(default_cfg.servers.contains_key("lobby"));
+        assert!(default_cfg.routing.fallback_server.is_none());
+        assert!(default_cfg.routing.forced_hosts.is_empty());
+        assert!(!default_cfg.bedrock.lan_discovery);
+        assert_eq!(default_cfg.security.max_packets_per_sec, 1000);
+
+        // Generated TOML must contain the Pterodactyl port replacement anchor and roundtrip cleanly
+        let toml_str = toml::to_string_pretty(&default_cfg).unwrap();
+        assert!(toml_str.contains("bind_address = \"0.0.0.0:25565\""));
+        assert!(!toml_str.contains("Alex"));
+
+        let parsed: Config = toml::from_str(&toml_str).unwrap();
+        assert!(parsed.permissions.users.is_empty());
+        assert_eq!(parsed.servers.len(), 1);
+
+        // Minimal / empty TOML falls back to defaults without failing deserialization
+        let minimal: Config = toml::from_str("").unwrap();
+        assert_eq!(minimal.server.bind_address, "0.0.0.0:25565");
+        assert!(minimal.permissions.users.is_empty());
+        assert!(minimal.servers.contains_key("lobby"));
     }
 }

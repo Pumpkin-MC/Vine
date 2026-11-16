@@ -112,6 +112,10 @@ impl PacketRateLimiter {
 
     /// Record a packet and return false if limit exceeded (flood detected)
     pub fn record_packet(&mut self) -> bool {
+        if self.max_packets_per_sec == 0 {
+            return true;
+        }
+
         let now = Instant::now();
         if now.duration_since(self.window_start) >= Duration::from_secs(1) {
             self.window_start = now;

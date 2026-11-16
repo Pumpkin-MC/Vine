@@ -262,6 +262,10 @@ mod tests {
     #[tokio::test]
     async fn test_send_command_execution_current_and_transfer() {
         let mut config = Config::default();
+        config.permissions.users.insert(
+            "Alex".to_string(),
+            crate::config::UserPermissionConfig::Groups(vec!["admin".to_string()]),
+        );
         config.servers.insert(
             "survival".to_string(),
             BackendConfig {
@@ -409,6 +413,10 @@ mod tests {
     #[test]
     fn test_send_command_offline_player() {
         let mut config = Config::default();
+        config.permissions.users.insert(
+            "Alex".to_string(),
+            crate::config::UserPermissionConfig::Groups(vec!["admin".to_string()]),
+        );
         config.servers.insert(
             "survival".to_string(),
             BackendConfig {
@@ -443,6 +451,10 @@ mod tests {
     #[test]
     fn test_send_command_suggestions() {
         let mut config = Config::default();
+        config.permissions.users.insert(
+            "Alex".to_string(),
+            crate::config::UserPermissionConfig::Groups(vec!["admin".to_string()]),
+        );
         config.servers.insert(
             "survival".to_string(),
             BackendConfig {

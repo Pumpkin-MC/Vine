@@ -45,43 +45,7 @@ pub fn command_error(msg: impl Into<String>) -> CommandSyntaxError {
     )
 }
 
-/// Translates legacy `&` formatting codes (`&0`-`&9`, `&a`-`&f`, `&k`-`&o`, `&r`) into Minecraft `§` codes.
-#[must_use]
-pub fn translate_color_codes(input: &str) -> String {
-    let mut out = String::with_capacity(input.len() + 8);
-    let mut chars = input.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '&'
-            && let Some(&next) = chars.peek()
-            && matches!(
-                next.to_ascii_lowercase(),
-                '0'..='9' | 'a'..='f' | 'k'..='o' | 'r'
-            )
-        {
-            chars.next();
-            out.push('§');
-            out.push(next.to_ascii_lowercase());
-        } else {
-            out.push(ch);
-        }
-    }
-    out
-}
-
-/// Strips Minecraft `§` color/formatting codes from a string.
-#[must_use]
-pub fn strip_formatting_codes(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '§' {
-            let _ = chars.next();
-        } else {
-            out.push(ch);
-        }
-    }
-    out
-}
+pub use crate::console::{strip_formatting_codes, translate_color_codes};
 
 /// Formats a duration in seconds as a compact human-readable string (e.g. `"2h 14m 5s"`).
 #[must_use]
@@ -211,7 +175,7 @@ impl CommandSender {
     pub fn send_message(&self, message: TextComponent) {
         match self {
             Self::Console => {
-                info!("{}", message.to_pretty_console());
+                info!("{}", crate::console::format_console_component(&message));
             }
             Self::Player { action_tx, .. } => {
                 let _ = action_tx.send(PlayerAction::Message(message));
@@ -219,9 +183,9 @@ impl CommandSender {
         }
     }
 
-    /// Sends a plain text message to the command sender
+    /// Sends a plain or legacy-formatted text message to the command sender
     pub fn send_text(&self, text: impl Into<String>) {
-        self.send_message(TextComponent::text(text.into()));
+        self.send_message(crate::console::legacy_component(text.into()));
     }
 
     /// Returns the name of the sender

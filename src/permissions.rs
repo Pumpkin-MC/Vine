@@ -124,15 +124,10 @@ pub struct PermissionsConfig {
 
 impl Default for PermissionsConfig {
     fn default() -> Self {
-        let mut users = HashMap::new();
-        users.insert(
-            "Alex".to_string(),
-            UserPermissionConfig::Groups(vec!["admin".to_string()]),
-        );
         Self {
             default_group: default_group_name(),
             groups: default_permission_groups(),
-            users,
+            users: HashMap::new(),
         }
     }
 }
@@ -239,21 +234,28 @@ mod tests {
 
     #[test]
     fn test_default_permissions() {
-        let config = PermissionsConfig::default();
+        let mut config = PermissionsConfig::default();
+        assert!(config.users.is_empty());
 
-        // Regular player in default group
-        assert!(config.has_permission("Steve", "vine.command.server"));
-        assert!(config.has_permission("Steve", "vine.command.glist"));
-        assert!(config.has_permission("Steve", "vine.command.list"));
-        assert!(config.has_permission("Steve", "vine.command.help"));
-        assert!(!config.has_permission("Steve", "vine.command.send"));
-        assert!(!config.has_permission("Steve", "vine.admin"));
+        // Regular players (including Alex) only get default group permissions out of the box
+        for player in ["Steve", "Alex"] {
+            assert!(config.has_permission(player, "vine.command.server"));
+            assert!(config.has_permission(player, "vine.command.glist"));
+            assert!(config.has_permission(player, "vine.command.list"));
+            assert!(config.has_permission(player, "vine.command.help"));
+            assert!(!config.has_permission(player, "vine.command.send"));
+            assert!(!config.has_permission(player, "vine.admin"));
+        }
 
-        // Alex in admin group
-        assert!(config.has_permission("Alex", "vine.command.send"));
-        assert!(config.has_permission("alex", "vine.command.send")); // case-insensitive
-        assert!(config.has_permission("Alex", "vine.command.server"));
-        assert!(config.has_permission("Alex", "any.random.node")); // * wildcard
+        // Explicitly assigned admin group grants admin and wildcard permissions
+        config.users.insert(
+            "AdminUser".to_string(),
+            UserPermissionConfig::Groups(vec!["admin".to_string()]),
+        );
+        assert!(config.has_permission("AdminUser", "vine.command.send"));
+        assert!(config.has_permission("adminuser", "vine.command.send")); // case-insensitive
+        assert!(config.has_permission("AdminUser", "vine.command.server"));
+        assert!(config.has_permission("AdminUser", "any.random.node")); // * wildcard
     }
 
     #[test]

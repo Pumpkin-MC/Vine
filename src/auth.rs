@@ -128,7 +128,7 @@ impl Authenticator {
         client_ip: &IpAddr,
         prevent_proxy_connections: bool,
     ) -> Result<AuthenticatedPlayer, AuthError> {
-        let url = if prevent_proxy_connections {
+        let url = if prevent_proxy_connections && !client_ip.is_loopback() {
             format!(
                 "https://sessionserver.mojang.com/session/minecraft/hasJoined?username={username}&serverId={server_hash}&ip={client_ip}"
             )

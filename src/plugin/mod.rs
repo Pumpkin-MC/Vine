@@ -879,7 +879,7 @@ impl pumpkin_command::node::CommandExecutor<ProxyCommandSource> for PluginComman
             Ok(Err(err_msg)) => {
                 context
                     .source
-                    .send_message(pumpkin_util::text::TextComponent::text(format!(
+                    .send_message(crate::console::legacy_component(format!(
                         "§cError: {err_msg}"
                     )));
                 Ok(0)
@@ -887,7 +887,7 @@ impl pumpkin_command::node::CommandExecutor<ProxyCommandSource> for PluginComman
             Err(e) => {
                 context
                     .source
-                    .send_message(pumpkin_util::text::TextComponent::text(format!(
+                    .send_message(crate::console::legacy_component(format!(
                         "§cPlugin command error: {e}"
                     )));
                 Ok(0)

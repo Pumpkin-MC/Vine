@@ -188,21 +188,22 @@ impl wit::vine::plugin::logging::Host for PluginHostState {
         level: wit::vine::plugin::logging::Level,
         message: String,
     ) -> wasmtime::Result<()> {
+        let formatted = crate::console::format_console_text(&message);
         match level {
             wit::vine::plugin::logging::Level::Trace => {
-                tracing::trace!("[Plugin: {}] {}", self.plugin_name, message);
+                tracing::trace!("[Plugin: {}] {}", self.plugin_name, formatted);
             }
             wit::vine::plugin::logging::Level::Debug => {
-                tracing::debug!("[Plugin: {}] {}", self.plugin_name, message);
+                tracing::debug!("[Plugin: {}] {}", self.plugin_name, formatted);
             }
             wit::vine::plugin::logging::Level::Info => {
-                tracing::info!("[Plugin: {}] {}", self.plugin_name, message);
+                tracing::info!("[Plugin: {}] {}", self.plugin_name, formatted);
             }
             wit::vine::plugin::logging::Level::Warn => {
-                tracing::warn!("[Plugin: {}] {}", self.plugin_name, message);
+                tracing::warn!("[Plugin: {}] {}", self.plugin_name, formatted);
             }
             wit::vine::plugin::logging::Level::Error => {
-                tracing::error!("[Plugin: {}] {}", self.plugin_name, message);
+                tracing::error!("[Plugin: {}] {}", self.plugin_name, formatted);
             }
         }
         Ok(())
@@ -218,7 +219,10 @@ impl wit::vine::plugin::command::Host for PluginHostState {
         if let Some(proxy) = &self.proxy {
             match sender.sender_type {
                 wit::vine::plugin::types::CommandSenderType::Console => {
-                    tracing::info!("[Console] {}", message);
+                    tracing::info!(
+                        "[Console] {}",
+                        crate::console::format_console_text(&message)
+                    );
                 }
                 wit::vine::plugin::types::CommandSenderType::Player => {
                     if let Some(uuid_str) = sender.player_uuid
@@ -230,7 +234,7 @@ impl wit::vine::plugin::command::Host for PluginHostState {
                             .find(|s| s.uuid == target_uuid)
                     {
                         let _ = session.action_tx.send(PlayerAction::Message(
-                            pumpkin_util::text::TextComponent::text(message),
+                            crate::console::legacy_component(&message),
                         ));
                     }
                 }
@@ -322,12 +326,16 @@ impl wit::vine::plugin::proxy::Host for PluginHostState {
 
     async fn broadcast(&mut self, message: String) -> wasmtime::Result<()> {
         if let Some(proxy) = &self.proxy {
+            let component = crate::console::legacy_component(&message);
             for session in proxy.session_manager.list_sessions() {
-                let _ = session.action_tx.send(PlayerAction::Message(
-                    pumpkin_util::text::TextComponent::text(message.clone()),
-                ));
+                let _ = session
+                    .action_tx
+                    .send(PlayerAction::Message(component.clone()));
             }
-            tracing::info!("[Broadcast] {}", message);
+            tracing::info!(
+                "[Broadcast] {}",
+                crate::console::format_console_component(&component)
+            );
         }
         Ok(())
     }
@@ -345,9 +353,12 @@ impl wit::vine::plugin::proxy::Host for PluginHostState {
                 .into_iter()
                 .find(|s| s.uuid == target_uuid)
         {
-            let _ = session.action_tx.send(PlayerAction::Message(
-                pumpkin_util::text::TextComponent::text(message),
-            ));
+            let _ =
+                session
+                    .action_tx
+                    .send(PlayerAction::Message(crate::console::legacy_component(
+                        &message,
+                    )));
             return Ok(true);
         }
         Ok(false)
