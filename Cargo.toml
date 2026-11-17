@@ -15,7 +15,7 @@ wasmtime = { version = "50.0.1", default-features = false, features = ["runtime"
 wasmtime-wasi = { version = "50.0.1", default-features = false, features = ["p2", "p3"] }
 wasmtime-wasi-http = { version = "50.0.1", default-features = false, features = ["p2", "p3", "default-send-request"] }
 hyper = { version = "^1.12", default-features = false }
-wasmparser = { version = "0.262", default-features = false, features = ["component-model", "std"] }
+wasmparser = { version = "0.263", default-features = false, features = ["component-model", "std"] }
 
 tokio = { version = "1.54", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
