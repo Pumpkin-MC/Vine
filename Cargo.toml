@@ -56,7 +56,7 @@ libc = "0.2"
 tempfile = "3"
 wasm-encoder = { version = "0.262", default-features = false, features = ["component-model", "std"] }
 wit-component = "0.262"
-wit-parser = "0.262"
+wit-parser = "0.263"
 
 [profile.release]
 lto = true
