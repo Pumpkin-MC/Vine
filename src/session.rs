@@ -62,18 +62,54 @@ impl SessionManager {
         &self.telemetry_sessions
     }
 
-    /// Registers a new active player session
-    pub fn register(&self, session: PlayerSession) {
-        self.telemetry_sessions.record_join(session.uuid);
-        if let Ok(mut lock) = self.sessions.write() {
-            lock.insert(session.username.to_ascii_lowercase(), session);
+    /// Registers a new active player session.
+    ///
+    /// Returns the previous session registered under the same (case-insensitive) username, if
+    /// any, so the caller can disconnect the older connection instead of leaving it unmanaged.
+    pub fn register(&self, session: PlayerSession) -> Option<PlayerSession> {
+        let uuid = session.uuid;
+        let key = session.username.to_ascii_lowercase();
+        let replaced = if let Ok(mut lock) = self.sessions.write() {
+            lock.insert(key, session)
+        } else {
+            None
+        };
+        if let Some(ref old) = replaced {
+            self.telemetry_sessions.record_leave(old);
         }
+        self.telemetry_sessions.record_join(uuid);
+        replaced
     }
 
     /// Unregisters an active session by username
     pub fn unregister(&self, username: &str) -> Option<PlayerSession> {
         let removed = if let Ok(mut lock) = self.sessions.write() {
             lock.remove(&username.to_ascii_lowercase())
+        } else {
+            None
+        };
+        if let Some(ref session) = removed {
+            self.telemetry_sessions.record_leave(session);
+        }
+        removed
+    }
+
+    /// Unregisters the session for `username` only if it still belongs to the connection that
+    /// owns `action_tx`.
+    ///
+    /// A connection must use this (not [`Self::unregister`]) on teardown: if the same username
+    /// logged in again in the meantime, the newer connection's session must stay registered.
+    pub fn unregister_connection(
+        &self,
+        username: &str,
+        action_tx: &mpsc::UnboundedSender<PlayerAction>,
+    ) -> Option<PlayerSession> {
+        let key = username.to_ascii_lowercase();
+        let removed = if let Ok(mut lock) = self.sessions.write() {
+            match lock.get(&key) {
+                Some(session) if session.action_tx.same_channel(action_tx) => lock.remove(&key),
+                _ => None,
+            }
         } else {
             None
         };
@@ -257,5 +293,61 @@ mod tests {
                 "Proxy is shutting down.".to_string()
             ))
         );
+    }
+
+    fn test_session(name: &str, tx: mpsc::UnboundedSender<PlayerAction>) -> PlayerSession {
+        PlayerSession {
+            username: name.to_string(),
+            uuid: Uuid::new_v4(),
+            current_server: "lobby".to_string(),
+            action_tx: tx,
+            client_ip: "127.0.0.1:1".to_string(),
+            protocol_version: 765,
+            client_brand: None,
+            locale: None,
+            view_distance: None,
+        }
+    }
+
+    #[test]
+    fn test_register_returns_replaced_session() {
+        let manager = SessionManager::new();
+        let (old_tx, _old_rx) = mpsc::unbounded_channel();
+        let (new_tx, _new_rx) = mpsc::unbounded_channel();
+
+        assert!(
+            manager
+                .register(test_session("Steve", old_tx.clone()))
+                .is_none()
+        );
+        let replaced = manager
+            .register(test_session("steve", new_tx))
+            .expect("second login with the same name replaces the first");
+        assert!(replaced.action_tx.same_channel(&old_tx));
+        assert_eq!(manager.count(), 1);
+    }
+
+    #[test]
+    fn test_unregister_connection_keeps_newer_session() {
+        let manager = SessionManager::new();
+        let (old_tx, _old_rx) = mpsc::unbounded_channel();
+        let (new_tx, _new_rx) = mpsc::unbounded_channel();
+
+        manager.register(test_session("Steve", old_tx.clone()));
+        manager.register(test_session("Steve", new_tx.clone()));
+
+        // The old connection tears down after the new one registered: it must not remove it.
+        assert!(manager.unregister_connection("Steve", &old_tx).is_none());
+        assert_eq!(manager.count(), 1);
+        assert!(
+            manager
+                .get_session("Steve")
+                .unwrap()
+                .action_tx
+                .same_channel(&new_tx)
+        );
+
+        assert!(manager.unregister_connection("steve", &new_tx).is_some());
+        assert_eq!(manager.count(), 0);
     }
 }

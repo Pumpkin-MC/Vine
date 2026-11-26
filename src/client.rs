@@ -15,8 +15,8 @@ use pumpkin_protocol::java::server::status::SStatusPingRequest;
 use pumpkin_protocol::{ClientPacket, ConnectionState, ServerPacket};
 use pumpkin_util::version::JavaMinecraftVersion;
 use thiserror::Error;
+use tokio::io::{BufReader, BufWriter};
 use tokio::net::TcpStream;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
@@ -24,7 +24,7 @@ use crate::auth::{AuthenticatedPlayer, Authenticator, KeyStore};
 use crate::backend::{BackendBridge, Router};
 use crate::command::CommandDispatcher;
 use crate::config::Config;
-use crate::network::PrefixedRead;
+use crate::network::{ClientReader, ClientWriter, IO_BUFFER_SIZE, PrefixedRead};
 use crate::plugin::PluginManager;
 use crate::plugin::api::{PlayerLoginEvent, PlayerPreLoginEvent, ProxyPingEvent};
 use crate::security::Sanitizer;
@@ -95,9 +95,11 @@ impl ClientHandler {
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     ) -> Result<(), ClientError> {
         let (read_half, write_half) = stream.into_split();
-        let reader = PrefixedRead::new(read_half, leftover_bytes);
+        let reader =
+            BufReader::with_capacity(IO_BUFFER_SIZE, PrefixedRead::new(read_half, leftover_bytes));
         let mut decoder = TCPNetworkDecoder::new(reader);
-        let mut encoder = TCPNetworkEncoder::new(write_half);
+        let mut encoder =
+            TCPNetworkEncoder::new(BufWriter::with_capacity(IO_BUFFER_SIZE, write_half));
 
         let handshake_timeout =
             Duration::from_secs(self.config.network.client_handshake_timeout_secs);
@@ -161,8 +163,8 @@ impl ClientHandler {
 
     async fn handle_status(
         &self,
-        decoder: &mut TCPNetworkDecoder<PrefixedRead<OwnedReadHalf>>,
-        encoder: &mut TCPNetworkEncoder<OwnedWriteHalf>,
+        decoder: &mut TCPNetworkDecoder<ClientReader>,
+        encoder: &mut TCPNetworkEncoder<ClientWriter>,
         client_version: JavaMinecraftVersion,
         virtual_host: &str,
     ) -> Result<(), ClientError> {
@@ -229,8 +231,8 @@ impl ClientHandler {
 
     async fn handle_login(
         &self,
-        mut decoder: TCPNetworkDecoder<PrefixedRead<OwnedReadHalf>>,
-        mut encoder: TCPNetworkEncoder<OwnedWriteHalf>,
+        mut decoder: TCPNetworkDecoder<ClientReader>,
+        mut encoder: TCPNetworkEncoder<ClientWriter>,
         client_version: JavaMinecraftVersion,
         virtual_host: String,
         client_ip: IpAddr,
@@ -259,8 +261,8 @@ impl ClientHandler {
 
     async fn authenticate_and_prepare_bridge(
         &self,
-        decoder: &mut TCPNetworkDecoder<PrefixedRead<OwnedReadHalf>>,
-        encoder: &mut TCPNetworkEncoder<OwnedWriteHalf>,
+        decoder: &mut TCPNetworkDecoder<ClientReader>,
+        encoder: &mut TCPNetworkEncoder<ClientWriter>,
         client_version: JavaMinecraftVersion,
         virtual_host: String,
         client_ip: IpAddr,
@@ -522,7 +524,7 @@ impl ClientHandler {
 
     /// Helper to send formatted CLoginDisconnect packet to client
     async fn kick(
-        encoder: &mut TCPNetworkEncoder<OwnedWriteHalf>,
+        encoder: &mut TCPNetworkEncoder<ClientWriter>,
         version: JavaMinecraftVersion,
         reason: &str,
     ) -> Result<(), ClientError> {

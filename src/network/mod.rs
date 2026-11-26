@@ -12,6 +12,19 @@ use crate::config::NetworkConfig;
 pub use prefixed_stream::PrefixedRead;
 pub use proxy_protocol::{ProxyHeaderResult, parse_proxy_protocol};
 
+/// Read buffer per connection half. The packet decoder reads VarInt length prefixes one byte at
+/// a time, so without buffering every byte costs a `read` syscall.
+pub const IO_BUFFER_SIZE: usize = 16 * 1024;
+
+/// Client-facing read half: prefix (PROXY protocol leftovers) over a buffered TCP read half.
+pub type ClientReader = tokio::io::BufReader<PrefixedRead<tokio::net::tcp::OwnedReadHalf>>;
+/// Client-facing write half. Callers must `flush()` after writing, as with any buffered writer.
+pub type ClientWriter = tokio::io::BufWriter<tokio::net::tcp::OwnedWriteHalf>;
+/// Backend-facing buffered read half.
+pub type BackendReader = tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>;
+/// Backend-facing buffered write half.
+pub type BackendWriter = tokio::io::BufWriter<tokio::net::tcp::OwnedWriteHalf>;
+
 /// Creates and tunes a Tokio `TcpListener` based on `NetworkConfig`
 pub fn create_tcp_listener(
     bind_addr_str: &str,
