@@ -195,8 +195,8 @@ impl BackendBridge {
         active_config: &BackendConfig,
     ) -> Result<
         (
-            TCPNetworkDecoder<tokio::net::tcp::OwnedReadHalf>,
-            TCPNetworkEncoder<tokio::net::tcp::OwnedWriteHalf>,
+            TCPNetworkDecoder<crate::network::BackendReader>,
+            TCPNetworkEncoder<crate::network::BackendWriter>,
             Vec<u8>,
         ),
         BridgeError,
@@ -214,8 +214,14 @@ impl BackendBridge {
         }
 
         let (backend_read, backend_write) = backend_stream.into_split();
-        let mut backend_decoder = TCPNetworkDecoder::new(backend_read);
-        let mut backend_encoder = TCPNetworkEncoder::new(backend_write);
+        let mut backend_decoder = TCPNetworkDecoder::new(tokio::io::BufReader::with_capacity(
+            crate::network::IO_BUFFER_SIZE,
+            backend_read,
+        ));
+        let mut backend_encoder = TCPNetworkEncoder::new(tokio::io::BufWriter::with_capacity(
+            crate::network::IO_BUFFER_SIZE,
+            backend_write,
+        ));
 
         let backend_host = match active_config.forwarding {
             ForwardingMode::BungeeCord => ForwardingHelper::build_bungeecord_host(
@@ -1068,6 +1074,9 @@ fn inject_proxy_commands(
     Some(new_payload)
 }
 
+/// Max extra queued packets written before a single flush towards the client.
+const CLIENT_WRITE_BATCH_MAX: usize = 64;
+
 impl BackendBridge {
     /// Tunnels packets back and forth between client and backend
     #[allow(clippy::too_many_arguments)]
@@ -1121,6 +1130,19 @@ impl BackendBridge {
                 if let Err(e) = client_encoder.write_packet(packet_bytes).await {
                     debug!("Client write failed for '{}': {:?}", username, e);
                     return TunnelExit::ClientDisconnected;
+                }
+                // Coalesce packets that are already queued into one flush (one syscall / TCP
+                // segment instead of one per packet). No timer: nothing waits for more data.
+                for _ in 0..CLIENT_WRITE_BATCH_MAX {
+                    match client_rx.try_recv() {
+                        Ok(more) => {
+                            if let Err(e) = client_encoder.write_packet(more).await {
+                                debug!("Client write failed for '{}': {:?}", username, e);
+                                return TunnelExit::ClientDisconnected;
+                            }
+                        }
+                        Err(_) => break,
+                    }
                 }
                 if let Err(e) = client_encoder.flush().await {
                     debug!("Client flush failed for '{}': {:?}", username, e);
