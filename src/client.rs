@@ -15,8 +15,8 @@ use pumpkin_protocol::java::server::status::SStatusPingRequest;
 use pumpkin_protocol::{ClientPacket, ConnectionState, ServerPacket};
 use pumpkin_util::version::JavaMinecraftVersion;
 use thiserror::Error;
-use tokio::net::TcpStream;
 use tokio::io::{BufReader, BufWriter};
+use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
@@ -95,12 +95,11 @@ impl ClientHandler {
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     ) -> Result<(), ClientError> {
         let (read_half, write_half) = stream.into_split();
-        let reader = BufReader::with_capacity(
-            IO_BUFFER_SIZE,
-            PrefixedRead::new(read_half, leftover_bytes),
-        );
+        let reader =
+            BufReader::with_capacity(IO_BUFFER_SIZE, PrefixedRead::new(read_half, leftover_bytes));
         let mut decoder = TCPNetworkDecoder::new(reader);
-        let mut encoder = TCPNetworkEncoder::new(BufWriter::with_capacity(IO_BUFFER_SIZE, write_half));
+        let mut encoder =
+            TCPNetworkEncoder::new(BufWriter::with_capacity(IO_BUFFER_SIZE, write_half));
 
         let handshake_timeout =
             Duration::from_secs(self.config.network.client_handshake_timeout_secs);

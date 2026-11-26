@@ -502,7 +502,13 @@ impl BackendBridge {
             .await
             .map_err(|e| BridgeError::EncodeError(e.to_string()))?;
 
-        self.online_players.fetch_add(1, Ordering::Relaxed);
+        // Owns the online counter and the session registration; cleans both up on any exit,
+        // including panics and task cancellation.
+        let mut connection_guard = ConnectionGuard::new(
+            self.online_players.clone(),
+            self.session_manager.clone(),
+            self.player.username.clone(),
+        );
         info!(
             "Player '{}' is now connected to backend '{}'! Online players: {}",
             self.player.username,
@@ -528,7 +534,7 @@ impl BackendBridge {
         self.plugin_manager.fire_player_join(&join_event).await;
 
         let (action_tx, mut action_rx) = tokio::sync::mpsc::unbounded_channel();
-        self.session_manager.register(PlayerSession {
+        let previous_session = self.session_manager.register(PlayerSession {
             username: self.player.username.clone(),
             uuid: self.player.id,
             current_server: current_server_name.clone(),
@@ -539,6 +545,18 @@ impl BackendBridge {
             locale: None,
             view_distance: None,
         });
+        connection_guard.attach_session(action_tx.clone());
+        if let Some(previous) = previous_session {
+            // Same username logged in again: drop the older connection (as the vanilla server
+            // does) instead of leaving it attached to a backend but unknown to the proxy.
+            warn!(
+                "Player '{}' logged in again; disconnecting the previous connection",
+                self.player.username
+            );
+            let _ = previous.action_tx.send(PlayerAction::Disconnect(
+                "You logged in from another location".to_string(),
+            ));
+        }
 
         // If shutdown already started while initial backend login was in flight, queue disconnect immediately.
         if !matches!(
@@ -868,8 +886,7 @@ impl BackendBridge {
             .fire_player_disconnect(&disconnect_event)
             .await;
 
-        self.session_manager.unregister(&self.player.username);
-        self.online_players.fetch_sub(1, Ordering::Relaxed);
+        drop(connection_guard);
         info!(
             "Player '{}' disconnected from proxy. Online players: {}",
             self.player.username,
@@ -904,6 +921,47 @@ impl BackendBridge {
                 let _ = encoder.flush().await;
             }
         }
+    }
+}
+
+/// Releases a connection's share of proxy state when dropped: the online-player counter and
+/// the session entry. Doing this in `Drop` keeps the books right on panics and cancellation.
+struct ConnectionGuard {
+    online_players: Arc<AtomicUsize>,
+    session_manager: Arc<SessionManager>,
+    username: String,
+    action_tx: Option<tokio::sync::mpsc::UnboundedSender<PlayerAction>>,
+}
+
+impl ConnectionGuard {
+    fn new(
+        online_players: Arc<AtomicUsize>,
+        session_manager: Arc<SessionManager>,
+        username: String,
+    ) -> Self {
+        online_players.fetch_add(1, Ordering::Relaxed);
+        Self {
+            online_players,
+            session_manager,
+            username,
+            action_tx: None,
+        }
+    }
+
+    /// Records the sender identifying this connection's registered session.
+    fn attach_session(&mut self, action_tx: tokio::sync::mpsc::UnboundedSender<PlayerAction>) {
+        self.action_tx = Some(action_tx);
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        if let Some(action_tx) = &self.action_tx {
+            // Only removes the session if it still belongs to this connection.
+            self.session_manager
+                .unregister_connection(&self.username, action_tx);
+        }
+        self.online_players.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -1074,6 +1132,9 @@ fn inject_proxy_commands(
     Some(new_payload)
 }
 
+/// Max clientbound packets queued per connection before the backend read loop is paused.
+const CLIENT_QUEUE_CAPACITY: usize = 1024;
+
 /// Max extra queued packets written before a single flush towards the client.
 const CLIENT_WRITE_BATCH_MAX: usize = 64;
 
@@ -1123,7 +1184,11 @@ impl BackendBridge {
             tokio::sync::Mutex<std::collections::HashMap<i32, PendingSuggestion>>,
         > = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
-        let (client_tx, mut client_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+        // Bounded so a slow or stalled client applies backpressure to the backend read loop
+        // instead of letting the queue grow without limit. Only `backend_to_client` waits for
+        // room; proxy-originated extras (chat, suggestions) use `try_send` and are dropped for a
+        // client that is not draining, so a stalled client can still be kicked via `action_loop`.
+        let (client_tx, mut client_rx) = tokio::sync::mpsc::channel::<Bytes>(CLIENT_QUEUE_CAPACITY);
 
         let client_writer = async {
             while let Some(packet_bytes) = client_rx.recv().await {
@@ -1380,7 +1445,7 @@ impl BackendBridge {
                                                 if let Ok(bytes) =
                                                     resp.serialize_packet(&client_version)
                                                 {
-                                                    let _ = client_tx.send(bytes);
+                                                    let _ = client_tx.try_send(bytes);
                                                 }
                                                 continue;
                                             }
@@ -1451,7 +1516,8 @@ impl BackendBridge {
                                                             if let Ok(bytes) =
                                                                 resp.serialize_packet(&cv)
                                                             {
-                                                                let _ = client_tx_clone.send(bytes);
+                                                                let _ =
+                                                                    client_tx_clone.try_send(bytes);
                                                             }
                                                         }
                                                     });
@@ -1531,7 +1597,7 @@ impl BackendBridge {
                                     backend_matches.into_boxed_slice(),
                                 );
                                 if let Ok(bytes) = merged.serialize_packet(&client_version) {
-                                    if client_tx.send(bytes).is_err() {
+                                    if client_tx.send(bytes).await.is_err() {
                                         return TunnelExit::ClientDisconnected;
                                     }
                                     continue;
@@ -1564,7 +1630,7 @@ impl BackendBridge {
                                 let _ = VarInt(raw_packet.id).encode(&mut full_packet);
                                 full_packet.extend_from_slice(&modified_payload);
 
-                                if client_tx.send(full_packet.into()).is_err() {
+                                if client_tx.send(full_packet.into()).await.is_err() {
                                     return TunnelExit::ClientDisconnected;
                                 }
                                 continue;
@@ -1575,7 +1641,7 @@ impl BackendBridge {
                         let _ = VarInt(raw_packet.id).encode(&mut full_packet);
                         full_packet.extend_from_slice(&raw_packet.payload);
 
-                        if client_tx.send(full_packet.into()).is_err() {
+                        if client_tx.send(full_packet.into()).await.is_err() {
                             return TunnelExit::ClientDisconnected;
                         }
                     }
@@ -1601,7 +1667,7 @@ impl BackendBridge {
                     PlayerAction::Message(text_comp) => {
                         let chat_msg = CSystemChatMessage::new(&text_comp, false);
                         if let Ok(bytes) = chat_msg.serialize_packet(&client_version) {
-                            let _ = client_tx.send(bytes);
+                            let _ = client_tx.try_send(bytes);
                         }
                     }
                     PlayerAction::Disconnect(reason) => {
@@ -1613,7 +1679,7 @@ impl BackendBridge {
                                 &channel, &data,
                             );
                         if let Ok(bytes) = custom_payload.serialize_packet(&client_version) {
-                            let _ = client_tx.send(bytes);
+                            let _ = client_tx.try_send(bytes);
                         }
                     }
                 }

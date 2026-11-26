@@ -426,7 +426,13 @@ impl ProxyServer {
                         }
                     }
                 }
-                Some(_) = client_tasks.join_next(), if !client_tasks.is_empty() => {}
+                Some(res) = client_tasks.join_next(), if !client_tasks.is_empty() => {
+                    if let Err(e) = res
+                        && e.is_panic()
+                    {
+                        error!("Client connection task panicked: {}", e);
+                    }
+                }
                 _ = shutdown_rx.recv() => {
                     let _ = shutdown_tx.send(());
                     info!("Shutting down Vine proxy listener...");
